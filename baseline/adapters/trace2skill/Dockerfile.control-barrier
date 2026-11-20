@@ -1,0 +1,2 @@
+FROM evolink-trace2skill:0.6
+COPY baseline/adapters/trace2skill/bridge.py /opt/evolink/baseline/adapters/trace2skill/bridge.py

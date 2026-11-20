@@ -1,0 +1,942 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import tempfile
+import time
+import zipfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from .baselines import (
+    BaselineInteractionError,
+    BaselineReply,
+    EvolutionContext,
+    FlowContext,
+    InteractionContext,
+    TurnContext,
+)
+from .baselines.manifest import load_mapping
+from .baselines.registry import create_baseline_runtime, resolve_baseline_selection
+from .model import TokenBudget, client_from_config
+from .sandbox import Sandbox, create_sandbox
+from .spec import BenchmarkSpec, FlowSpec, TurnSpec, load_spec
+from .user_sim import UserSimulator
+from .verifier import CheckResult, DeterministicVerifier, ExecVerifier, L1LifeJudge, LLMJudge, PythonVerifier
+from .arena_runtime import ArenaVerifier, apply_updates as apply_arena_updates
+from .run_conditions import RunCondition, parse_run_condition
+
+
+@dataclass
+class InteractionRecord:
+    index: int
+    request: str
+    response: str
+    actions: list[dict[str, Any]]
+    tool_calls: list[dict[str, Any]]
+    events: list[dict[str, Any]]
+    state_update: dict[str, Any]
+    action_error: str | None
+    score: float
+    passed: bool
+    feedback: str
+    verifier_details: dict[str, Any]
+    sandbox: dict[str, Any]
+    state_keys: list[str]
+    usage: dict[str, Any]
+    state_before: dict[str, Any] = field(default_factory=dict)
+    workspace_before: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TurnRecord:
+    turn_id: str
+    score: float
+    passed: bool
+    interactions: list[InteractionRecord] = field(default_factory=list)
+    evolution: dict[str, Any] = field(default_factory=dict)
+
+
+def _archive_tree(source: Path, archive: Path) -> None:
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path in source.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                bundle.write(path, arcname=path.relative_to(source).as_posix())
+
+
+def _restore_tree_archive(archive: Path, target: Path) -> None:
+    with zipfile.ZipFile(archive) as bundle:
+        for name in bundle.namelist():
+            relative = PurePosixPath(name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"unsafe workspace checkpoint entry: {name}")
+            destination = target.joinpath(*relative.parts)
+            if name.endswith("/"):
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(bundle.read(name))
+
+
+def _load_turn_records(path: Path) -> list[TurnRecord]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError(f"invalid completed turn records: {path}")
+    records: list[TurnRecord] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError(f"invalid completed turn record: {path}")
+        interactions = [InteractionRecord(**row) for row in item.get("interactions", [])]
+        records.append(TurnRecord(
+            turn_id=str(item["turn_id"]), score=float(item["score"]), passed=bool(item["passed"]),
+            interactions=interactions, evolution=dict(item.get("evolution", {})),
+        ))
+    return records
+
+
+class Runner:
+    def __init__(
+        self,
+        spec: BenchmarkSpec,
+        *,
+        output_dir: Path,
+        backend: str | None = None,
+        image: str | None = None,
+        agent_mode: str | None = None,
+        judge_mode: str | None = None,
+        learner_mode: str = "frozen",
+        max_total_tokens: int | None = None,
+        baseline: str | None = None,
+        baseline_manifest: str | None = None,
+        baseline_config: dict[str, Any] | None = None,
+        repo_root: Path | None = None,
+        resume_checkpoint: Path | None = None,
+        fail_fast_infrastructure: bool = False,
+        condition: str | None = None,
+        capture_interaction_recovery: bool = False,
+    ) -> None:
+        self.spec = spec
+        self.output_dir = output_dir
+        self.backend = backend
+        self.image = image
+        self.judge_mode = judge_mode or str(spec.judge.get("type", "deterministic"))
+        self.learner_mode = learner_mode
+        self.budget = TokenBudget(max_total_tokens or int(spec.benchmark.get("max_total_tokens", 3_000_000)))
+        self.repo_root = (repo_root or Path(__file__).resolve().parents[1]).resolve()
+        self.resume_checkpoint = resume_checkpoint.resolve() if resume_checkpoint else None
+        self.fail_fast_infrastructure = fail_fast_infrastructure
+        self.capture_interaction_recovery = capture_interaction_recovery
+        self.condition = parse_run_condition(condition) if condition is not None else None
+        self.baseline_id, resolved_manifest, runtime_overrides = resolve_baseline_selection(
+            spec,
+            baseline_override=baseline,
+            agent_override=agent_mode,
+            config_override=baseline_config,
+            manifest_override=baseline_manifest,
+        )
+        self.agent_mode = self.baseline_id
+        if self.condition is RunCondition.EVOLVING:
+            self.learner_mode = learner_mode = "evolving"
+        if self.condition is not None and not self.condition.policy.sut_evolution_enabled:
+            runtime_overrides = {**runtime_overrides, "evolution": {
+                **runtime_overrides.get("evolution", {}), "policy": "disabled"}}
+            self.learner_mode = learner_mode = "frozen"
+        self._evaluated_boundary_ref = runtime_overrides.get("options", {}).get("l1_evaluated_boundary_recovery")
+        self._evaluated_boundary = None
+        self._runtime_manifest = resolved_manifest
+        self._runtime_overrides = runtime_overrides
+        self.runtime = create_baseline_runtime(
+            self.baseline_id,
+            spec=spec,
+            budget=self.budget,
+            learner_mode=learner_mode,
+            repo_root=self.repo_root,
+            manifest_path=resolved_manifest,
+            overrides=runtime_overrides,
+        )
+
+        self.client = None
+        if self.judge_mode in {"llm", "hybrid"}:
+            merged = dict(spec.agent)
+            merged.update(spec.judge)
+            self.client = client_from_config(merged, self.budget)
+        self.program_verifier = DeterministicVerifier()
+        self.python_verifier = PythonVerifier()
+        self.exec_verifier = ExecVerifier()
+        if self.judge_mode not in {"deterministic", "llm", "hybrid"}:
+            raise ValueError(f"unsupported judge type: {self.judge_mode}")
+        # Program verifiers remain reusable and stateless. LLM judges are
+        # instantiated inside _evaluate so each Interaction gets a fresh judge.
+        self.judge = self.program_verifier if self.judge_mode in {"deterministic", "hybrid"} else None
+
+    def run(self, flow: FlowSpec) -> dict[str, Any]:
+        started = time.time()
+        flow_dir = self.output_dir / flow.id
+        flow_dir.mkdir(parents=True, exist_ok=True)
+        self._active_trace_path = flow_dir / "live_trace.jsonl"
+        sandbox = create_sandbox(flow.sandbox, self.backend, self.image)
+        turn_records: list[TurnRecord] = []
+        runtime_started = False
+        run_failed = False
+        failure_token_budget = None
+        resume_index = 0
+        if self._evaluated_boundary_ref is not None and self.resume_checkpoint is not None:
+            raise ValueError("independent evaluated boundary cannot combine with original resume")
+        if self._evaluated_boundary_ref is not None:
+            from .l1_evaluated_boundary import validate, claim
+            authority, record = validate(self._evaluated_boundary_ref, spec=self.spec, flow=flow,
+                config=self._runtime_overrides, output=self.output_dir, baseline=self.baseline_id,
+                condition=self.condition.value if self.condition else None, limit=self.budget.limit)
+            claim(self._evaluated_boundary_ref, authority)
+            restored = Path(tempfile.mkdtemp(prefix="evolink-independent-l1-boundary-"))
+            try:
+                _restore_tree_archive(Path(authority["workspace_archive"]), restored)
+                sandbox.setup({"host_copy": str(restored)})
+            finally:
+                shutil.rmtree(restored, ignore_errors=True)
+            self.runtime.set_resume_state_archive(Path(authority["state_archive"]))
+            self.budget.used, self.budget.calls = record["usage"]["total_tokens"], record["usage"]["api_calls"]
+            self._evaluated_boundary = (authority, record)
+        if self.resume_checkpoint is not None:
+            checkpoint_meta = self.resume_checkpoint / "checkpoint.json"
+            checkpoint_workspace = self.resume_checkpoint / "workspace.zip"
+            checkpoint_state = self.resume_checkpoint / "baseline_state.zip"
+            checkpoint_turns = self.resume_checkpoint / "completed_turns.json"
+            if not all(path.is_file() for path in (checkpoint_meta, checkpoint_workspace, checkpoint_state, checkpoint_turns)):
+                raise ValueError(f"invalid resume checkpoint: {self.resume_checkpoint}")
+            checkpoint_data = json.loads(checkpoint_meta.read_text(encoding="utf-8"))
+            if checkpoint_data.get("flow_id") != flow.id or checkpoint_data.get("baseline", self.baseline_id) != self.baseline_id:
+                raise ValueError("checkpoint flow/baseline identity mismatch")
+            if checkpoint_data.get("condition") != (self.condition.value if self.condition else None):
+                raise ValueError("checkpoint condition mismatch")
+            resume_index = int(checkpoint_data["next_turn_index"])
+            restored = Path(tempfile.mkdtemp(prefix="evolink-l1-resume-"))
+            try:
+                _restore_tree_archive(checkpoint_workspace, restored)
+                sandbox.setup({"host_copy": str(restored)})
+            finally:
+                shutil.rmtree(restored, ignore_errors=True)
+            turn_records = _load_turn_records(checkpoint_turns)
+            if [record.turn_id for record in turn_records] != [turn.id for turn in flow.turns[:resume_index]]:
+                raise ValueError("checkpoint completed prefix differs from requested stream")
+            self.budget.used = int(checkpoint_data.get("token_budget", {}).get("used", 0))
+            self.budget.calls = int(checkpoint_data.get("token_budget", {}).get("calls", 0))
+            set_resume = getattr(self.runtime, "set_resume_state_archive", None)
+            if not callable(set_resume):
+                raise ValueError(f"baseline {self.baseline_id} does not support exact checkpoint resume")
+            set_resume(checkpoint_state)
+        try:
+            self.runtime.start_flow(
+                FlowContext(
+                    flow_id=flow.id,
+                    workspace=sandbox.workspace_path(),
+                    output_dir=flow_dir,
+                    metadata=self._public_metadata(flow.metadata),
+                    workspace_mount=sandbox.workspace_mount(),
+                )
+            )
+            runtime_started = True
+            for index, turn in enumerate(flow.turns):
+                if index < resume_index:
+                    continue
+                if self.condition is RunCondition.RESET:
+                    if index > 0:
+                        self.runtime.end_flow()
+                    self._reseed_condition_workspace(sandbox, flow)
+                    if index > 0:
+                        self.runtime = create_baseline_runtime(
+                            self.baseline_id, spec=self.spec, budget=self.budget,
+                            learner_mode=self.learner_mode, repo_root=self.repo_root,
+                            manifest_path=self._runtime_manifest, overrides=self._runtime_overrides)
+                        self.runtime.start_flow(FlowContext(
+                            flow_id=flow.id, workspace=sandbox.workspace_path(),
+                            output_dir=flow_dir, metadata=self._public_metadata(flow.metadata),
+                            workspace_mount=sandbox.workspace_mount()))
+                turn_records.append(self._run_turn(turn, sandbox))
+                self._save_checkpoint(flow_dir, flow, index, turn, sandbox, turn_records)
+            final_snapshot = self.runtime.snapshot_state()
+        except BaseException:
+            run_failed = True
+            failure_token_budget = asdict(self.budget)
+            raise
+        finally:
+            try:
+                if runtime_started:
+                    self.runtime.end_flow()
+                if run_failed and (self.capture_interaction_recovery or self.baseline_id in {"deepseek-harness", "codex"}):
+                    # The runtime is stopped before saving the actual failed
+                    # workspace. Sandbox.close() otherwise destroys this state.
+                    try:
+                        sandbox.sync_workspace_to_host()
+                        archive = flow_dir / "error_workspace.zip"
+                        _archive_tree(sandbox.workspace_path(), archive)
+                        archive.chmod(0o600)
+                        (flow_dir / "error_workspace_receipt.json").write_text(json.dumps({
+                            "flow_id": flow.id, "baseline": self.baseline_id,
+                            "condition": self.condition.value if self.condition else None,
+                            "runtime_stopped_before_archive": True,
+                            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                            "token_budget_at_failure": failure_token_budget,
+                        }, indent=2) + "\n")
+                    except Exception as capture_error:
+                        (flow_dir / "error_workspace_capture_failure.json").write_text(
+                            json.dumps({"error_type": type(capture_error).__name__}) + "\n")
+            finally:
+                sandbox.close()
+        runtime_metadata = self.runtime.metadata()
+        result = {
+            "schema_version": "0.1",
+            "flow_id": flow.id,
+            "baseline": self.baseline_id,
+            "condition": self.condition.value if self.condition else None,
+            "baseline_runtime": runtime_metadata,
+            **({"independent_evaluated_boundary": {"authorization": self._evaluated_boundary_ref,
+                "original_native_session_exact": False, "historical_usage_unknown": True,
+                "independent_fuse_is_original_ceiling": False, "original_I1_agent_verifier_replays": 0}}
+                if self._evaluated_boundary_ref is not None else {}),
+            "learner_mode": runtime_metadata.get("learner", learner_mode_label(self.learner_mode)),
+            "agent_mode": self.agent_mode,
+            "judge_mode": self.judge_mode,
+            "turns": [asdict(record) for record in turn_records],
+            "metrics": self._metrics(turn_records),
+            "token_budget": asdict(self.budget),
+            "state": final_snapshot.state,
+            "state_snapshot": final_snapshot.to_dict(),
+            "wall_clock_seconds": round(time.time() - started, 3),
+        }
+        (flow_dir / "summary.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        with (flow_dir / "trace.jsonl").open("w", encoding="utf-8") as stream:
+            for record in turn_records:
+                for interaction in record.interactions:
+                    stream.write(json.dumps({"flow_id": flow.id, "turn_id": record.turn_id, **asdict(interaction)}, ensure_ascii=False) + "\n")
+        return result
+
+    def _save_checkpoint(self, flow_dir: Path, flow: FlowSpec, index: int, turn: TurnSpec, sandbox: Sandbox, turn_records: list[TurnRecord]) -> None:
+        """Persist the exact post-turn workspace for selective reruns."""
+        flow_key = hashlib.sha256(flow.id.encode("utf-8")).hexdigest()[:10]
+        root = self.output_dir / "_checkpoints" / flow_key / f"t{index + 1:04d}"
+        root.mkdir(parents=True, exist_ok=True)
+        # DockerSandbox uses a host bind mount for /workspace, so copying the
+        # host-side path is both exact and reliable on Windows.  `docker cp`
+        # can materialize transient/dangling entries while an agent is still
+        # finishing filesystem operations, which made checkpoint creation
+        # fail even though the turn itself had succeeded.
+        sandbox.sync_workspace_to_host()
+        source = sandbox.workspace_path()
+        _archive_tree(source, root / "workspace.zip")
+        save_state = getattr(self.runtime, "save_checkpoint_state", None)
+        exact_baseline_state = callable(save_state)
+        if exact_baseline_state:
+            save_state(root / "baseline_state.zip")
+        else:
+            with zipfile.ZipFile(root / "baseline_state.zip", "w"):
+                pass
+        (root / "completed_turns.json").write_text(
+            json.dumps([asdict(record) for record in turn_records], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (root / "checkpoint.json").write_text(
+            json.dumps({"flow_id": flow.id, "baseline": self.baseline_id, "condition": self.condition.value if self.condition else None, "completed_turn_index": index, "next_turn_index": index + 1, "turn_id": turn.id, "token_budget": asdict(self.budget), "exact_baseline_state": exact_baseline_state}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _reseed_condition_workspace(self, sandbox: Sandbox, flow: FlowSpec) -> None:
+        """Reset only this sandbox's entries, then restore the initial public seed.
+
+        Current-turn transitions remain applied by _run_turn; earlier transitions
+        and agent artifacts are deliberately not replayed in reset conditions.
+        """
+        sandbox.sync_workspace_to_host()
+        for entry in list(sandbox.workspace_path().iterdir()):
+            sandbox.remove("/workspace/" + entry.name)
+        seed = flow.turns[0].setup
+        sandbox.setup({key: seed[key] for key in ("host_copy", "files", "arena_session_seed") if key in seed})
+        apply_arena_updates({"arena_session_seed": seed["arena_session_seed"]} if "arena_session_seed" in seed else {}, sandbox.workspace_path())
+        sandbox.sync_workspace_from_host()
+
+    def _capture_recovery_state(self, turn: TurnSpec, sandbox: Sandbox, phase: str,
+                                interactions: list, history: list, request: str) -> None:
+        """Private evidence only: never a committed Turn or an automatic replay grant."""
+        if not self.capture_interaction_recovery:
+            return
+        directory = self._active_trace_path.parent / "_interaction_recovery" / turn.id / phase
+        directory.mkdir(parents=True, exist_ok=False)
+        sandbox.sync_workspace_to_host()
+        _archive_tree(sandbox.workspace_path(), directory / "workspace.zip")
+        save = getattr(self.runtime, "save_checkpoint_state", None)
+        if not callable(save):
+            raise RuntimeError("recovery capture requires declared baseline checkpoint support")
+        save(directory / "baseline_state.zip")
+        evidence = {
+            "schema": "trievo.l1-private-recovery-evidence.v1", "turn_id": turn.id,
+            "phase": phase, "committed_turn": False, "automatic_retry_authorized": False,
+            "request": request, "history": history,
+            "interactions": [asdict(item) for item in interactions],
+            "token_budget": asdict(self.budget), "captured_at": time.time(),
+            "opaque_native_process_memory_captured": False,
+            "files": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+                      for name in ("workspace.zip", "baseline_state.zip")},
+        }
+        (directory / "evidence.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+        for path in directory.iterdir():
+            path.chmod(0o600)
+
+    def _run_turn(self, turn: TurnSpec, sandbox: Sandbox) -> TurnRecord:
+        # A daemon-owned workspace may have been changed by the baseline in
+        # the preceding Turn. Materialize it before applying host-side Arena
+        # updates, then publish the merged tree back to the shared volume.
+        sandbox.sync_workspace_to_host()
+        boundary = self._evaluated_boundary if turn.id == "turn1" else None
+        if boundary is None:
+            sandbox.setup(turn.setup)
+            apply_arena_updates(turn.setup, sandbox.workspace_path())
+        sandbox.sync_workspace_from_host()
+        self.runtime.start_turn(
+            TurnContext(
+                turn_id=turn.id,
+                request=turn.request,
+                max_interactions=turn.max_interactions,
+                metadata=self._public_metadata(turn.metadata),
+            )
+        )
+        user_client = client_from_config({**self.spec.agent, "thinking": "disabled"}, self.budget) if turn.user.get("llm_post_failure") else None
+        user = UserSimulator(turn.user, turn.request, client=user_client)
+        request = user.initial_request
+        history: list[dict[str, Any]] = []
+        interactions: list[InteractionRecord] = []
+        all_events: list[dict[str, Any]] = []
+        all_tool_calls: list[dict[str, Any]] = []
+        turn_workspace_before = sandbox.snapshot()
+        turn_state_before = self.runtime.snapshot_state().state
+        first_index = 1
+        if boundary is not None:
+            from .l1_evaluated_boundary import task_inventory, verify_migrated_state
+            authority, original = boundary
+            if task_inventory(sandbox.snapshot()) != task_inventory(original["sandbox"]):
+                raise ValueError("independent task restoration changed before UserSim")
+            verify_migrated_state(authority, self.runtime.snapshot_state())
+            item = InteractionRecord(**{k:v for k,v in original.items() if k != "turn_id"})
+            interactions.append(item)
+            all_events.extend(item.events)
+            all_tool_calls.extend(item.tool_calls)
+            turn_workspace_before = original["workspace_before"]
+            turn_state_before = original["state_before"]
+            history.extend([{"role":"user", "content":item.request},
+                            {"role":"assistant", "content":item.response},
+                            {"role":"judge", "content":item.feedback}])
+            with self._active_trace_path.open("a", encoding="utf-8") as trace:
+                trace.write(json.dumps(original, ensure_ascii=False) + "\n")
+            self._capture_recovery_state(turn, sandbox, "independent-before-user-simulator", interactions, history, request)
+            from .l1_evaluated_boundary import BoundarySimulatorClient
+            original_client = user.client
+            user.client = BoundarySimulatorClient(original_client, authority, self.budget)
+            try:
+                request = user.next_request(history=history, feedback=item.feedback)
+            finally:
+                user.client = original_client
+            self._capture_recovery_state(turn, sandbox, "independent-after-user-simulator", interactions, history, request)
+            first_index = item.index + 1
+            self._evaluated_boundary = None
+        for index in range(first_index, turn.max_interactions + 1):
+            self._capture_recovery_state(turn, sandbox, f"i{index:04d}-before", interactions, history, request)
+            agent_sandbox = sandbox.snapshot()
+            state_before = self.runtime.snapshot_state().state
+            workspace_before = self._workspace_evidence(sandbox) if turn.verifier.get("type") == "l1_life_judge" else agent_sandbox
+            if self.spec.agent.get("include_workspace_content"):
+                for item in agent_sandbox.get("files", []):
+                    try:
+                        item["content"] = sandbox.read_file(str(item["path"]))
+                    except Exception:
+                        item["content"] = "(file unavailable)"
+            model_error = None
+            try:
+                reply = self.runtime.interact(
+                    InteractionContext(
+                        turn_id=turn.id,
+                        interaction_index=index,
+                        request=request,
+                        history=list(history),
+                        sandbox=agent_sandbox,
+                        remaining_token_budget=max(0, self.budget.limit - self.budget.used),
+                    )
+                )
+            except BaselineInteractionError as exc:
+                model_error = str(exc)
+                reply = exc.reply
+            except RuntimeError as exc:
+                model_error = str(exc)
+                reply = BaselineReply()
+            action_error = None
+            try:
+                if not reply.actions_are_executed:
+                    self._apply_actions(reply.actions, sandbox)
+                executed_calls = (
+                    reply.tool_calls
+                    if reply.tool_calls_are_executed
+                    else self._apply_tool_calls(reply.tool_calls, sandbox)
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                action_error = str(exc)
+                executed_calls = []
+            if not action_error:
+                all_events.extend(item for item in reply.events if isinstance(item, dict))
+                all_tool_calls.extend(executed_calls)
+            native_limit = isinstance(reply.raw, dict) and reply.raw.get("limit_exhausted")
+            native_error = reply.raw.get("execution_error") if isinstance(reply.raw, dict) else None
+            if native_error:
+                check = CheckResult(0.0, False, "Native agent attempt ended with an execution error; no replay.",
+                                    {"type": "native_execution_error", "error": native_error,
+                                     "usage_status": reply.raw.get("usage_status")})
+            elif native_limit:
+                check = CheckResult(0.0, False, "Native agent exhausted its declared work budget.",
+                                    {"type": "work_limit", "reasons": reply.raw.get("limit_reasons", [])})
+            elif model_error:
+                check = CheckResult(0.0, False, f"Model request failed: {model_error}", {"type": "model_error", "error": model_error})
+            elif action_error:
+                check = CheckResult(0.0, False, f"Invalid agent action: {action_error}", {"type": "action_error", "error": action_error})
+            else:
+                state_snapshot = self.runtime.snapshot_state()
+                interaction_trace = [self._public_interaction(item) for item in interactions]
+                interaction_trace.append({
+                    "index": index,
+                    "request": request,
+                    "response": reply.text,
+                    "actions": reply.actions,
+                    "tool_calls": executed_calls,
+                    "events": reply.events,
+                    "state_update": reply.state_update,
+                })
+                trajectory = {
+                    "events": all_events,
+                    "tool_calls": all_tool_calls,
+                    "tool_results": [item.get("result") for item in all_tool_calls if isinstance(item, dict) and "result" in item],
+                    "state": state_snapshot.state,
+                    "interactions": interaction_trace,
+                    "state_before": state_before,
+                    "state_after": state_snapshot.state,
+                    "state_diff": self._state_diff(state_before, state_snapshot.state),
+                    "workspace_before": workspace_before,
+                    "workspace_after": self._workspace_evidence(sandbox) if turn.verifier.get("type") == "l1_life_judge" else sandbox.snapshot(),
+                }
+                if turn.verifier.get("type") == "l1_arena":
+                    trajectory["workspace_before"] = turn_workspace_before
+                    trajectory["state_before"] = turn_state_before
+                try:
+                    check = self._evaluate(turn.verifier, reply.text, sandbox, trajectory)
+                except RuntimeError as exc:
+                    check = CheckResult(0.0, False, f"Verifier model request failed: {exc}", {"type": "verifier_model_error", "error": str(exc)})
+            state_snapshot = self.runtime.snapshot_state()
+            state_keys = [str(item["path"]) for item in state_snapshot.files] or sorted(state_snapshot.state)
+            interaction = InteractionRecord(
+                index,
+                request,
+                reply.text,
+                reply.actions,
+                executed_calls,
+                reply.events,
+                reply.state_update,
+                action_error,
+                check.score,
+                check.passed,
+                check.feedback,
+                check.details,
+                sandbox.snapshot(),
+                state_keys,
+                reply.usage.to_dict(),
+                state_before,
+                workspace_before,
+            )
+            interactions.append(interaction)
+            if hasattr(self, "_active_trace_path"):
+                with self._active_trace_path.open("a", encoding="utf-8") as trace:
+                    trace.write(json.dumps({"turn_id": turn.id, **asdict(interaction)}, ensure_ascii=False) + "\n")
+            if self.fail_fast_infrastructure and (model_error or check.details.get("type") in {"verifier_model_error", "exec_verifier_timeout", "native_execution_error", "llm_parse_error", "l1_life_judge_parse_error"}):
+                raise RuntimeError(f"evaluation infrastructure failed in {turn.id}: {check.feedback}")
+            history.extend([{"role": "user", "content": request}, {"role": "assistant", "content": reply.text}, {"role": "judge", "content": check.feedback}])
+            if native_error or native_limit or (check.passed and check.score >= turn.success_threshold):
+                break
+            if index < turn.max_interactions:
+                request = user.next_request(history=history, feedback=check.feedback)
+        trajectory = [self._public_interaction(item) for item in interactions]
+        feedback = [
+            {
+                "interaction_index": item.index,
+                "score": item.score,
+                "passed": item.passed,
+                "feedback": item.feedback,
+            }
+            for item in interactions
+        ]
+        self._capture_recovery_state(turn, sandbox, "before-evolution", interactions, history, request)
+        evolution = self.runtime.evolve(
+            EvolutionContext(turn_id=turn.id, trajectory=trajectory, feedback=feedback,
+                             update_enabled=self.condition is None or self.condition.policy.sut_evolution_enabled,
+                             skip_reason=None if self.condition is None or self.condition.policy.sut_evolution_enabled else f"condition:{self.condition.value}")
+        )
+        # The baseline defines a Turn score as the first successful Interaction's
+        # score, or the final Interaction's score when the Turn is unsuccessful.
+        # Do not select the historical maximum: that would hide later failures.
+        final = interactions[-1]
+        if turn.verifier.get("type") == "l1_arena" and turn.verifier["evaluation"]["primary_evaluation"]["type"] == "deterministic_response_check":
+            post_evolution = ArenaVerifier().evaluate(turn.verifier, final.response, sandbox, {
+                "tool_calls": all_tool_calls, "workspace_before": turn_workspace_before, "workspace_after": sandbox.snapshot(),
+                "state_before": turn_state_before, "state_after": self.runtime.snapshot_state().state,
+            })
+            final.score, final.passed = post_evolution.score, post_evolution.passed
+            final.feedback, final.verifier_details = post_evolution.feedback, post_evolution.details
+        return TurnRecord(turn.id, final.score, final.passed, interactions, evolution.to_dict())
+
+    @staticmethod
+    def _public_interaction(item: InteractionRecord) -> dict[str, Any]:
+        return {
+            "index": item.index,
+            "request": item.request,
+            "response": item.response,
+            "actions": item.actions,
+            "tool_calls": item.tool_calls,
+            "events": item.events,
+            "state_update": item.state_update,
+            "action_error": item.action_error,
+            "score": item.score,
+            "passed": item.passed,
+            "feedback": item.feedback,
+            "sandbox": item.sandbox,
+            "state_keys": item.state_keys,
+            "usage": item.usage,
+            "state_before": item.state_before,
+            "workspace_before": item.workspace_before,
+        }
+
+    @staticmethod
+    def _public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        public = metadata.get("public", {})
+        return dict(public) if isinstance(public, dict) else {}
+
+    def _evaluate(self, verifier: dict[str, Any], response: str, sandbox: Sandbox, trajectory: Any = None) -> Any:
+        verifier_type = str(verifier.get("type", ""))
+        if verifier_type in {"llm", "llm_rubric"}:
+            if self.judge_mode not in {"llm", "hybrid"}:
+                raise ValueError("this Turn requires an LLM verifier, but judge mode is not hybrid/llm")
+            # The baseline gives every Interaction an independent Judge
+            # context. The client and token budget remain shared infrastructure,
+            # but the evaluator itself carries no state across Interactions.
+            judge = LLMJudge(
+                self.client,
+                str(self.spec.judge.get("rubric", "")),
+                int(self.spec.judge.get("max_output_tokens", 2048)),
+            )
+            return judge.evaluate(verifier, response, sandbox, trajectory)
+        if verifier_type == "l1_life_judge":
+            if self.judge_mode not in {"llm", "hybrid"}:
+                raise ValueError("this Turn requires an LLM verifier, but judge mode is not hybrid/llm")
+            return L1LifeJudge(self.client).evaluate(verifier, response, sandbox, trajectory)
+        if verifier_type == "python_verifier":
+            return self.python_verifier.evaluate(verifier, response, sandbox, trajectory)
+        if verifier_type == "exec_verifier":
+            return self.exec_verifier.evaluate(verifier, response, sandbox, trajectory)
+        if verifier_type == "l1_arena":
+            return ArenaVerifier().evaluate(verifier, response, sandbox, trajectory)
+        return self.program_verifier.evaluate(verifier, response, sandbox)
+
+    def _apply_actions(self, actions: list[dict[str, Any]], sandbox: Sandbox) -> None:
+        for action in actions:
+            op = action.get("op")
+            if op == "write_file":
+                path = action.get("path")
+                if not isinstance(path, str) or not path:
+                    raise ValueError("write_file action requires a non-empty path")
+                sandbox.write_file(path, str(action.get("content", "")))
+            elif op == "remove":
+                path = action.get("path")
+                if not isinstance(path, str) or not path:
+                    raise ValueError("remove action requires a non-empty path")
+                sandbox.remove(path)
+            elif op in {None, ""}:
+                continue
+            else:
+                raise ValueError(f"unsupported agent action: {op}")
+
+    def _apply_tool_calls(self, tool_calls: list[dict[str, Any]], sandbox: Sandbox) -> list[dict[str, Any]]:
+        """Execute the small, deterministic L1 tool surface and retain an auditable trace.
+
+        The benchmark intentionally does not connect to users' real calendars or messaging
+        systems.  Calls therefore act on sandbox-local fixtures with stable return values.
+        """
+        executed: list[dict[str, Any]] = []
+        for raw_call in tool_calls:
+            if not isinstance(raw_call, dict):
+                raise ValueError("tool_calls items must be objects")
+            tool = raw_call.get("tool") or raw_call.get("name")
+            if not isinstance(tool, str) or not tool:
+                raise ValueError("tool call requires a non-empty tool name")
+            arguments = raw_call.get("arguments", raw_call.get("params", raw_call.get("parameters", {})))
+            if not isinstance(arguments, dict):
+                raise ValueError("tool call arguments must be an object")
+            result: dict[str, Any] = {}
+            if tool == "calendar.create_event":
+                required = ("calendar_id", "title", "start", "end")
+                missing = [key for key in required if not str(arguments.get(key, ""))]
+                if missing:
+                    raise ValueError(f"calendar.create_event missing {', '.join(missing)}")
+                events = self._read_json_list(sandbox, "/workspace/state/calendar_events.json")
+                result = {"event_id": f"evt_{len(events) + 1:03d}", "status": "created"}
+                events.append({"tool": tool, "arguments": arguments, "result": result})
+                sandbox.write_file("/workspace/state/calendar_events.json", json.dumps(events, ensure_ascii=False, indent=2))
+            elif tool == "message.resolve_group":
+                group_name = str(arguments.get("group_name", ""))
+                if group_name == "Aurora 交付群":
+                    result = {"group_id": "grp_aurora_delivery", "group_name": group_name}
+                else:
+                    result = {"group_id": None, "group_name": group_name}
+            elif tool == "message.send_message":
+                messages = self._read_json_list(sandbox, "/workspace/state/messages.json")
+                result = {"message_id": f"msg_{len(messages) + 1:03d}", "status": "sent"}
+                messages.append({"tool": tool, "arguments": arguments, "result": result})
+                sandbox.write_file("/workspace/state/messages.json", json.dumps(messages, ensure_ascii=False, indent=2))
+            elif tool == "file.create_file":
+                filename = arguments.get("filename") or arguments.get("path")
+                if not isinstance(filename, str) or not filename:
+                    raise ValueError("file.create_file requires filename or path")
+                result = {"path": filename, "status": "created"}
+            elif tool == "file.write_text":
+                path = self._l1_life_path(arguments.get("path"))
+                overwrite = bool(arguments.get("overwrite", False))
+                try:
+                    sandbox.read_file(path)
+                    exists = True
+                except Exception:
+                    exists = False
+                if exists and not overwrite:
+                    raise ValueError("file.write_text refuses to overwrite an existing file")
+                content = arguments.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("file.write_text requires string content")
+                sandbox.write_file(path, content)
+                result = {"path": str(arguments.get("path")), "status": "written", "bytes": len(content.encode("utf-8"))}
+            elif tool == "file.append_text":
+                path = self._l1_life_path(arguments.get("path"))
+                content = arguments.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("file.append_text requires string content")
+                try:
+                    prior = sandbox.read_file(path)
+                except Exception as exc:
+                    raise ValueError("file.append_text requires an existing file") from exc
+                sandbox.write_file(path, prior + content)
+                result = {"path": str(arguments.get("path")), "status": "appended", "bytes": len(content.encode("utf-8"))}
+            elif tool == "file.edit_text":
+                path = self._l1_life_path(arguments.get("path"))
+                instruction = str(arguments.get("edit_instruction", ""))
+                replacement = arguments.get("replacement")
+                if not isinstance(replacement, str):
+                    raise ValueError("file.edit_text requires string replacement")
+                try:
+                    prior = sandbox.read_file(path)
+                except Exception as exc:
+                    raise ValueError("file.edit_text requires an existing file") from exc
+                if "first markdown heading" not in instruction.lower():
+                    raise ValueError("unsupported localized edit instruction")
+                updated, count = re.subn(r"(?m)^#{1,6}[^\r\n]*", replacement, prior, count=1)
+                if count != 1:
+                    raise ValueError("file.edit_text could not find the first Markdown heading")
+                sandbox.write_file(path, updated)
+                result = {"path": str(arguments.get("path")), "status": "edited", "edits": 1}
+            elif tool == "file.rename":
+                old_path = self._l1_life_path(arguments.get("old_path"))
+                new_path = self._l1_life_path(arguments.get("new_path"))
+                try:
+                    content = sandbox.read_file(old_path)
+                except Exception as exc:
+                    raise ValueError("file.rename requires an existing old_path") from exc
+                try:
+                    sandbox.read_file(new_path)
+                except Exception:
+                    pass
+                else:
+                    raise ValueError("file.rename refuses to overwrite an existing new_path")
+                sandbox.write_file(new_path, content)
+                sandbox.remove(old_path)
+                result = {"old_path": str(arguments.get("old_path")), "new_path": str(arguments.get("new_path")), "status": "renamed"}
+            elif tool == "file.read_text":
+                path = self._l1_life_path(arguments.get("path"))
+                result = {"path": str(arguments.get("path")), "content": sandbox.read_file(path)}
+            elif tool == "calendar.create_reminder":
+                required = ("calendar_id", "title", "date")
+                missing = [key for key in required if not str(arguments.get(key, ""))]
+                if missing:
+                    raise ValueError(f"calendar.create_reminder missing {', '.join(missing)}")
+                reminders = self._tool_state_list(sandbox, "calendar_reminders")
+                entry = {key: arguments[key] for key in required}
+                entry["reminder_id"] = f"rem_{len(reminders) + 1:03d}"
+                reminders.append(entry)
+                self._write_tool_state_list(sandbox, "calendar_reminders", reminders)
+                result = {"reminder_id": entry["reminder_id"], "status": "created"}
+            elif tool == "message.prepare_draft":
+                required = ("contact_id", "subject", "body_summary")
+                missing = [key for key in required if not str(arguments.get(key, ""))]
+                if missing:
+                    raise ValueError(f"message.prepare_draft missing {', '.join(missing)}")
+                drafts = self._tool_state_list(sandbox, "message_drafts")
+                entry = {key: arguments[key] for key in required}
+                entry["draft_id"] = f"draft_{len(drafts) + 1:03d}"
+                drafts.append(entry)
+                self._write_tool_state_list(sandbox, "message_drafts", drafts)
+                result = {"draft_id": entry["draft_id"], "status": "prepared"}
+            elif tool == "file.tag_artifact":
+                required = ("tag", "source_task_id")
+                missing = [key for key in required if not str(arguments.get(key, ""))]
+                if missing:
+                    raise ValueError(f"file.tag_artifact missing {', '.join(missing)}")
+                tags = self._tool_state_list(sandbox, "artifact_tags")
+                tags.append({key: arguments[key] for key in required})
+                self._write_tool_state_list(sandbox, "artifact_tags", tags)
+                result = {"status": "tagged"}
+            else:
+                raise ValueError(f"unsupported sandbox tool: {tool}")
+            executed.append({"tool": tool, "arguments": arguments, "result": result})
+        life_tools = {
+            "file.write_text", "file.append_text", "file.edit_text", "file.rename", "file.read_text",
+            "calendar.create_reminder", "message.prepare_draft", "file.tag_artifact",
+        }
+        # L1-Life records side effects in tool_state/current_state.json.  Do
+        # not create an extra audit file, because its preservation checks treat
+        # unrelated workspace writes as evidence of an intrusive implementation.
+        if any(item.get("tool") not in life_tools for item in executed):
+            audit = self._read_json_list(sandbox, "/workspace/state/tool_calls.json")
+            audit.extend(executed)
+            sandbox.write_file("/workspace/state/tool_calls.json", json.dumps(audit, ensure_ascii=False, indent=2))
+        return executed
+
+    @staticmethod
+    def _read_json_list(sandbox: Sandbox, path: str) -> list[Any]:
+        try:
+            value = json.loads(sandbox.read_file(path))
+            return value if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _l1_life_path(value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("L1-Life file tool requires a non-empty relative path")
+        normalized = value.replace("\\", "/").strip()
+        if normalized.startswith("/") or ".." in normalized.split("/"):
+            raise ValueError("L1-Life file paths must remain inside the workspace")
+        return "/workspace/" + normalized
+
+    @staticmethod
+    def _tool_state_list(sandbox: Sandbox, key: str) -> list[Any]:
+        try:
+            state = json.loads(sandbox.read_file("/workspace/tool_state/current_state.json"))
+            value = state.get(key, []) if isinstance(state, dict) else []
+            return list(value) if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _write_tool_state_list(sandbox: Sandbox, key: str, value: list[Any]) -> None:
+        path = "/workspace/tool_state/current_state.json"
+        try:
+            state = json.loads(sandbox.read_file(path))
+            state = state if isinstance(state, dict) else {}
+        except Exception:
+            state = {}
+        state[key] = value
+        sandbox.write_file(path, json.dumps(state, ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def _state_diff(before: Any, after: Any, prefix: str = "") -> list[dict[str, Any]]:
+        if before == after:
+            return []
+        if isinstance(before, dict) and isinstance(after, dict):
+            changes: list[dict[str, Any]] = []
+            for key in sorted(set(before) | set(after)):
+                name = f"{prefix}.{key}" if prefix else str(key)
+                changes.extend(Runner._state_diff(before.get(key), after.get(key), name))
+            return changes
+        return [{"path": prefix or "$", "before": before, "after": after}]
+
+    @staticmethod
+    def _workspace_evidence(sandbox: Sandbox) -> dict[str, Any]:
+        snapshot = sandbox.snapshot()
+        files: list[dict[str, Any]] = []
+        for item in snapshot.get("files", []):
+            path = item.get("path") if isinstance(item, dict) else None
+            if not isinstance(path, str):
+                continue
+            try:
+                content = sandbox.read_file(path)
+            except Exception:
+                content = "(file unavailable)"
+            files.append({**item, "content": content})
+        return {**snapshot, "files": files}
+
+    @staticmethod
+    def _metrics(turns: list[TurnRecord]) -> dict[str, Any]:
+        scores = [turn.score for turn in turns]
+        interactions = [item for turn in turns for item in turn.interactions]
+        return {
+            "turn_count": len(turns),
+            "turn_success_rate": sum(item.passed for item in turns) / len(turns) if turns else 0.0,
+            "mean_turn_score": sum(scores) / len(scores) if scores else 0.0,
+            "interaction_count": len(interactions),
+            "mean_interactions_per_turn": len(interactions) / len(turns) if turns else 0.0,
+            "first_interaction_success_rate": sum(item.interactions[0].passed for item in turns) / len(turns) if turns else 0.0,
+        }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the specification-driven EvoLink-Bench baseline.")
+    parser.add_argument("--spec", required=True)
+    parser.add_argument("--output", default="runs")
+    parser.add_argument("--flow-id")
+    parser.add_argument("--backend", choices=["local", "docker"])
+    parser.add_argument("--image")
+    parser.add_argument("--baseline", help="baseline id registered by a manifest or legacy adapter")
+    parser.add_argument("--baseline-manifest", help="explicit baseline manifest path")
+    parser.add_argument("--baseline-config", help="JSON/YAML manifest overrides")
+    parser.add_argument("--agent", choices=["scripted", "openai_compatible"])
+    parser.add_argument("--judge", choices=["deterministic", "llm", "hybrid"])
+    parser.add_argument("--learner", choices=["frozen", "raw-replay", "evolving", "oracle-update"], default="frozen")
+    parser.add_argument("--max-total-tokens", type=int)
+    args = parser.parse_args()
+    spec = load_spec(args.spec)
+    baseline_config = load_mapping(args.baseline_config) if args.baseline_config else None
+    flows = [flow for flow in spec.flows if args.flow_id is None or flow.id == args.flow_id]
+    if not flows:
+        raise SystemExit(f"flow not found: {args.flow_id}")
+    for flow in flows:
+        runner = Runner(
+            spec,
+            output_dir=Path(args.output),
+            backend=args.backend,
+            image=args.image,
+            agent_mode=args.agent,
+            judge_mode=args.judge,
+            learner_mode=args.learner,
+            max_total_tokens=args.max_total_tokens,
+            baseline=args.baseline,
+            baseline_manifest=args.baseline_manifest,
+            baseline_config=baseline_config,
+        )
+        result = runner.run(flow)
+        print(json.dumps({"flow_id": flow.id, "baseline": result["baseline"], "metrics": result["metrics"], "token_budget": result["token_budget"]}, ensure_ascii=False))
+
+
+def learner_mode_label(mode: str) -> str:
+    labels = {
+        "reset": "FrozenLearner",
+        "frozen": "FrozenLearner",
+        "evolving": "EvolvingLearner",
+        "raw-replay": "RawReplayLearner",
+        "oracle-update": "OracleLearner",
+    }
+    return labels.get(mode, mode)
+
+
+if __name__ == "__main__":
+    main()

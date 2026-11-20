@@ -1,0 +1,2249 @@
+"""Bounded-concurrency, checkpoint-aware driver for the 2026-09-03 package matrix.
+
+The evaluator owns fail-fast decisions; this driver never retries a failed
+paid run blindly. A heartbeat can repair the issue and restart this command.
+"""
+from __future__ import annotations
+
+import argparse
+import heapq
+import hashlib
+import json
+import math
+import os
+import shlex
+import subprocess
+import sys
+import time
+from collections import Counter, deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Make direct ``python tools/run_new_package_matrix.py`` execution resolve the
+# adjacent package regardless of the caller's current working directory or
+# whether the checkout has been installed in editable mode.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from evolink_bench.provider_profiles import (
+    PROVIDER_PROFILES,
+    ProviderCredential,
+    configure_provider_environment,
+    provider_credentials,
+    validate_generated_profile,
+)
+
+L2_CONDITIONS = ("reset", "frozen", "evolving")
+BASELINES = ("hermes", "skillopt", "trace2skill", "prime-agent", "adaptive-auto-harness", "opencode")
+
+
+
+def load(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save(path: Path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _l1_manifests(package: Path):
+    return sorted(
+        package.glob("stream-*/stream.json"),
+        key=lambda p: int(p.parent.name.split("-")[-1]),
+    )
+
+
+def _l2_manifests(package: Path):
+    return sorted((package / "streams").glob("*/stream.json"))
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _l2_panel(package: Path, panel_id: str | None) -> dict[str, object] | None:
+    panels_path = package / "panels.json"
+    if not panels_path.is_file():
+        if panel_id:
+            raise ValueError(f"L2 package has no panels.json: {package}")
+        return None
+    panels = load(panels_path)
+    if panels.get("schema_version") != "l2_panels/1.0":
+        raise ValueError(f"unsupported L2 panels schema: {panels_path}")
+    manifest_path = package / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"panel-aware L2 package is missing manifest.json: {package}")
+    manifest = load(manifest_path)
+    if manifest.get("schema_version") not in {"l2_taskstream/1.1", "l2_taskstream/1.2"}:
+        raise ValueError("panel-aware L2 package must declare l2_taskstream/1.1 or 1.2")
+    binding = manifest.get("panel_manifest")
+    digest = _sha256_file(panels_path)
+    if (
+        not isinstance(binding, dict)
+        or binding.get("schema_version") != "l2_panels/1.0"
+        or binding.get("path") != "panels.json"
+        or binding.get("sha256") != digest
+    ):
+        raise ValueError("L2 manifest panel binding does not match panels.json")
+    definitions = panels.get("panels")
+    if not isinstance(definitions, list):
+        raise ValueError("L2 panels manifest must contain a panels list")
+    panel_ids = sorted(
+        str(item.get("panel_id")) for item in definitions if isinstance(item, dict)
+    )
+    if panel_id is None:
+        raise ValueError(
+            f"L2 package declares panels; pass --l2-panel ({', '.join(panel_ids)})"
+        )
+    matches = [
+        item for item in definitions
+        if isinstance(item, dict) and item.get("panel_id") == panel_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"unknown L2 panel {panel_id!r}; expected one of {panel_ids}")
+    selected = matches[0]
+    stream_ids = selected.get("stream_ids")
+    if (
+        not isinstance(stream_ids, list)
+        or not stream_ids
+        or not all(isinstance(item, str) and item for item in stream_ids)
+        or len(set(stream_ids)) != len(stream_ids)
+    ):
+        raise ValueError(f"L2 panel {panel_id!r} contains duplicate stream ids")
+    if selected.get("allows_cross_panel_aggregation") is not False:
+        raise ValueError(f"L2 panel {panel_id!r} must forbid cross-panel aggregation")
+    v5_binding = {}
+    if manifest.get("schema_version") == "l2_taskstream/1.2":
+        if not selected.get("pool_id"):
+            raise ValueError("V5 panel requires pool_id")
+        v5_binding = {"pool_id": selected["pool_id"],
+                      "package_manifest_sha256": _sha256_file(manifest_path)}
+        for field, filename in (("pool_manifest", "pools.json"), ("runtime_profiles", "runtime_profiles.json")):
+            catalog = manifest.get(field, {})
+            actual = _sha256_file(package / filename)
+            if catalog.get("path") != filename or catalog.get("sha256") != actual:
+                raise ValueError(f"V5 {field} binding does not match package")
+            v5_binding[field + "_sha256"] = actual
+    return {
+        "panel_id": panel_id,
+        "panel_manifest_sha256": digest,
+        "selected_stream_ids": stream_ids,
+        "panel_purpose": selected.get("purpose"),
+        "allows_cross_panel_aggregation": False,
+        **v5_binding,
+    }
+
+
+def _resolve_l1_package(packages: Path, explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    return packages / "l1_arena"
+
+
+def _resolve_l2_package(packages: Path, explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    if _l2_manifests(packages):
+        return packages
+    candidates = sorted(
+        child for child in packages.iterdir()
+        if child.is_dir() and child.name != "l1_arena" and _l2_manifests(child)
+    ) if packages.is_dir() else []
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        return packages / "L2_Demo_V4"
+    names = ", ".join(str(path) for path in candidates)
+    raise ValueError(f"multiple L2 packages found; pass --l2-package explicitly: {names}")
+
+
+def _turn_roles(manifest: dict):
+    roles = {}
+    for item in manifest.get("turns", []):
+        if isinstance(item, dict) and item.get("turn_id") and item.get("sequence_role"):
+            roles[str(item["turn_id"])] = str(item["sequence_role"])
+    return roles
+
+
+def jobs(
+    repo: Path,
+    root: Path,
+    packages: Path | None = None,
+    *,
+    l1_package: Path | None = None,
+    l2_package: Path | None = None,
+    l2_conditions: tuple[str, ...] | list[str] | None = None,
+    l1_conditions: tuple[str, ...] | list[str] | None = None,
+    baselines: tuple[str, ...] | list[str] | None = None,
+    l2_panel: str | None = None,
+    level: str | None = None,
+):
+    if level not in (None, "l1", "l2"):
+        raise ValueError(f"unknown level: {level}")
+    if packages is None:
+        local_packages = repo.parent / "new-packages-20260903"
+        packages = local_packages if local_packages.is_dir() else repo / "benchmarks/current"
+    if l2_panel == "all" and level != "l1":
+        package = _resolve_l2_package(packages, l2_package)
+        definitions = load(package / "panels.json")["panels"]
+        rows = []
+        for definition in definitions:
+            panel_id = definition["panel_id"]
+            panel_rows = jobs(repo, root / "panels" / panel_id, packages,
+                              l2_package=package, l2_conditions=l2_conditions,
+                              l2_panel=panel_id, level="l2", baselines=baselines)
+            for row in panel_rows:
+                row["id"] = "l2/" + panel_id + "/" + row["id"].removeprefix("l2/")
+            rows.extend(panel_rows)
+        if level is None:
+            rows.extend(jobs(repo, root, packages, l1_package=l1_package,
+                             l1_conditions=l1_conditions, level="l1", baselines=baselines))
+        return rows
+    conditions = tuple(dict.fromkeys(l2_conditions or ("evolving",)))
+    unknown = sorted(set(conditions) - set(L2_CONDITIONS))
+    if unknown:
+        raise ValueError(f"unknown L2 condition(s): {unknown}")
+    rows = []
+    if set(l1_conditions or ()) - set(L2_CONDITIONS):
+        raise ValueError("unknown L1 condition(s)")
+    selected_levels = (level,) if level else ("l2", "l1")
+    for level in selected_levels:
+        package = (_resolve_l2_package(packages, l2_package) if level == "l2"
+                   else _resolve_l1_package(packages, l1_package))
+        manifests = _l2_manifests(package) if level == "l2" else _l1_manifests(package)
+        if not manifests:
+            raise ValueError(f"No {level} stream manifests found in {package}")
+        panel = _l2_panel(package, l2_panel) if level == "l2" else None
+        if panel is not None:
+            by_stream_id = {}
+            for path in manifests:
+                manifest = load(path)
+                by_stream_id[str(manifest["stream_id"])] = path
+            missing = [stream_id for stream_id in panel["selected_stream_ids"] if stream_id not in by_stream_id]
+            if missing:
+                raise ValueError(f"L2 panel {panel['panel_id']!r} references missing streams: {missing}")
+            manifests = [by_stream_id[stream_id] for stream_id in panel["selected_stream_ids"]]
+        for index, path in enumerate(manifests, 1):
+            manifest = load(path)
+            turns = manifest["ordering"]["turn_order"] if level == "l2" else [item["turn_id"] for item in manifest["turns"]]
+            row_conditions = conditions if level == "l2" else tuple(dict.fromkeys(l1_conditions or (None,)))
+            for condition in row_conditions:
+                for agent in baselines or BASELINES:
+                    if condition:
+                        job_id = f"{level}/{condition}/{agent}/s{index:02d}"
+                        output = root / level / condition / agent / f"s{index:02d}"
+                    else:
+                        job_id = f"{level}/{agent}/s{index:02d}"
+                        output = root / level / agent / f"s{index:02d}"
+                    rows.append({"id": job_id, "level": level, "agent": agent,
+                                 "package": str(package), "stream": path.parent.name,
+                                 "flow_id": manifest["stream_id"], "turns": turns,
+                                 "condition": condition, "turn_roles": _turn_roles(manifest),
+                                 "output": str(output),
+                                 **(panel or {})})
+    return rows
+
+
+def _friday_affinity_key(row: dict) -> str:
+    """Return the stream/baseline identity shared only across conditions."""
+    return f"{row['level']}:{row['flow_id']}:{row['agent']}"
+
+
+def restrict_plan_jobs(rows: list[dict], job_ids: list[str]) -> list[dict]:
+    """Define a new selected-stream matrix before scheduling or aggregation."""
+    if (not isinstance(job_ids, list) or not job_ids or
+            any(not isinstance(value, str) for value in job_ids) or
+            len(job_ids) != len(set(job_ids)) or
+            not set(job_ids) <= {row["id"] for row in rows}):
+        raise ValueError("matrix plan must contain unique existing job IDs")
+    wanted = set(job_ids)
+    return [row for row in rows if row["id"] in wanted]
+
+
+def friday_slot_capacities(
+    credentials: tuple[ProviderCredential, ...],
+    configured: dict | None = None,
+) -> tuple[int, ...]:
+    """Resolve public slot labels to positive worker limits, defaulting to one.
+
+    These are worker budgets, not RPM or request-level semaphores. Callers must
+    reserve headroom for native agents/judges that issue parallel API calls.
+    """
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict) or set(configured) - {c.slot for c in credentials}:
+        raise ValueError("Friday capacities must be an object keyed by configured slot names")
+    capacities = tuple(configured.get(c.slot, 1) for c in credentials)
+    if any(type(value) is not int or value < 1 for value in capacities):
+        raise ValueError("Friday slot capacities must be positive integers (worker limits)")
+    return capacities
+
+
+def assign_friday_credentials(
+    rows: list[dict],
+    credentials: tuple[ProviderCredential, ...],
+    capacities: tuple[int, ...] | None = None,
+) -> dict[str, object]:
+    """Assign each stream/baseline group with deterministic LPT balancing.
+
+    The credential values never enter rows or returned metadata. All jobs for
+    one baseline on one stream share a slot and serial lane across conditions.
+    Independent lanes expose heterogeneous worker capacity while retaining
+    provider-side cache locality and condition order. Work estimates use Turn
+    counts, so they cannot predict actual request latency or RPM consumption.
+    """
+    if not credentials:
+        raise ValueError("Friday credential pool is empty")
+    capacities = capacities if capacities is not None else (1,) * len(credentials)
+    if len(capacities) != len(credentials):
+        raise ValueError("Friday capacities must match the credential pool")
+    friday_slot_capacities(credentials, dict(zip((c.slot for c in credentials), capacities)))
+    capacity_mode = any(value != 1 for value in capacities)
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    for index, row in enumerate(rows):
+        groups.setdefault(_friday_affinity_key(row), []).append((index, row))
+
+    weighted_groups = []
+    condition_order = {"reset": 0, "frozen": 1, "evolving": 2}
+    for affinity_key, members in groups.items():
+        members.sort(
+            key=lambda item: (
+                condition_order.get(item[1].get("condition"), 3),
+                item[0],
+            )
+        )
+        work_units = sum(max(1, len(row.get("turns", []))) for _, row in members)
+        weighted_groups.append((work_units, affinity_key, members))
+    weighted_groups.sort(key=lambda item: (-item[0], item[1]))
+
+    slot_loads = [0] * len(credentials)
+    slot_group_counts = [0] * len(credentials)
+    # Each independent lane runs its groups sequentially. Zero-load ties spread
+    # across accounts before filling the next lane. Bound lane allocation by
+    # group count even if a configuration declares a very large capacity.
+    available_slots = [
+        (0, lane, index)
+        for index, capacity in enumerate(capacities)
+        for lane in range(min(capacity, len(groups)))
+    ]
+    lane_loads = [[0] * min(capacity, len(groups)) for capacity in capacities]
+    heapq.heapify(available_slots)
+    assignments = {}
+    for work_units, affinity_key, members in weighted_groups:
+        current_load, lane, slot_index = heapq.heappop(available_slots)
+        credential = credentials[slot_index]
+        group_order = slot_group_counts[slot_index]
+        slot_group_counts[slot_index] += 1
+        slot_loads[slot_index] += work_units
+        lane_loads[slot_index][lane] = current_load + work_units
+        heapq.heappush(available_slots, (current_load + work_units, lane, slot_index))
+        assignments[affinity_key] = {
+            "credential_slot": slot_index + 1,
+            "credential_env": credential.slot,
+            "estimated_work_units": work_units,
+        }
+        if capacity_mode:
+            assignments[affinity_key]["credential_lane"] = lane + 1
+        for job_order, (source_index, row) in enumerate(members):
+            row.update(
+                credential_slot=slot_index + 1,
+                credential_env=credential.slot,
+                credential_group_order=group_order,
+                credential_job_order=job_order,
+                credential_source_order=source_index,
+            )
+            if capacity_mode:
+                row["credential_lane"] = lane + 1
+            else:
+                row.pop("credential_lane", None)
+
+    schedule = {
+        "strategy": (
+            "stream_baseline_affinity_capacity_lanes_lpt_v3" if capacity_mode
+            else "stream_baseline_affinity_lpt_turn_weighted_v2"
+        ),
+        "slot_names": [credential.slot for credential in credentials],
+        "slot_estimated_work_units": slot_loads,
+        "slot_affinity_group_counts": slot_group_counts,
+        "affinity_assignments": assignments,
+    }
+    if capacity_mode:
+        schedule.update(slot_capacities=list(capacities), slot_lane_work_units=lane_loads)
+    return schedule
+
+
+def validate_friday_schedule(previous: dict, current: dict) -> None:
+    """Reject a credential reorder or changed affinity plan in an existing root."""
+    saved = previous.get("credential_schedule") if isinstance(previous, dict) else None
+    if not saved:
+        return
+    for field in ("slot_names", "strategy", "affinity_assignments", "slot_capacities"):
+        if saved.get(field) != current.get(field):
+            raise ValueError(
+                "Friday credential schedule differs from this output root; "
+                "restore the original credential slots/selection or use a new --root"
+            )
+
+
+def friday_concurrency(requested: int | None, credential_count: int, group_count: int) -> int:
+    """Return the worker count bounded by total slot capacity and group count."""
+    if credential_count < 1 or group_count < 1:
+        raise ValueError("Friday scheduling requires at least one credential and one affinity group")
+    available = min(credential_count, group_count)
+    return min(requested, available) if requested is not None else available
+
+
+def job_environment(
+    provider_mode: str,
+    credentials: tuple[ProviderCredential, ...],
+    row: dict,
+    base_environment=None,
+    *,
+    profile_configuration=None,
+) -> dict[str, str]:
+    """Build a worker environment containing only the row's selected secret."""
+    if not credentials:
+        raise ValueError("provider credential pool is empty")
+    slot = int(row.get("credential_slot", 1))
+    if slot < 1 or slot > len(credentials):
+        raise ValueError(f"invalid credential slot {slot} for job {row.get('id')}")
+    environment = dict(os.environ if base_environment is None else base_environment)
+    configure_provider_environment(
+        provider_mode,
+        environment,
+        credential=credentials[slot - 1],
+    )
+    if profile_configuration:
+        if profile_configuration.get('name') != provider_mode:
+            raise ValueError('worker transport profile provider mismatch')
+        for field, variable, minimum, maximum in (
+            ('timeout_seconds', 'TRIEVO_API_TIMEOUT_SECONDS', 1, 3600),
+            ('max_retries', 'TRIEVO_API_MAX_RETRIES', 0, 20),
+        ):
+            if field in profile_configuration:
+                value = profile_configuration[field]
+                if type(value) is not int or not minimum <= value <= maximum:
+                    raise ValueError(f'invalid worker transport profile {field}')
+                environment[variable] = str(value)
+    return environment
+
+
+def _scheduled_pending_rows(rows: list[dict]) -> list[dict]:
+    if not any("credential_slot" in row for row in rows):
+        if os.environ.get("TRIEVO_INTERLEAVE_LEVELS") == "1":
+            # Optional dispatch policy: preserve within-level order while
+            # admitting L1 and L2 together. Job identity/results are unchanged.
+            by_level = {level: deque(row for row in rows if row.get("level") == level)
+                        for level in ("l2", "l1")}
+            ordered = []
+            while any(by_level.values()):
+                for queue in by_level.values():
+                    if queue:
+                        ordered.append(queue.popleft())
+            ordered.extend(row for row in rows if row.get("level") not in by_level)
+            return ordered
+        return rows
+    if any("credential_lane" in row for row in rows):
+        # Spread admission across accounts when the machine-wide worker limit
+        # is lower than the sum of slot capacities.
+        return sorted(rows, key=lambda row: (
+            int(row.get("credential_group_order", 0)),
+            int(row.get("credential_slot", 0)),
+            int(row.get("credential_job_order", 0)),
+            int(row.get("credential_source_order", 0)),
+        ))
+    return sorted(
+        rows,
+        key=lambda row: (
+            int(row.get("credential_slot", 0)),
+            int(row.get("credential_group_order", 0)),
+            int(row.get("credential_job_order", 0)),
+            int(row.get("credential_source_order", 0)),
+        ),
+    )
+
+
+def _pop_eligible(
+    queue: deque,
+    active_slots: set[int] | dict[int, int],
+    slot_capacities: dict[int, int] | None = None,
+    active_lanes: set[tuple[int, int]] | None = None,
+    admission=None,
+) -> dict | None:
+    """Admit within slot capacity, keeping each affinity lane sequential."""
+    capacities = slot_capacities or {}
+    for _ in range(len(queue)):
+        row = queue.popleft()
+        slot = row.get("credential_slot")
+        if slot is None and (admission is None or admission(row)):
+            return row
+        if slot is None:
+            queue.append(row)
+            continue
+        slot = int(slot)
+        count = int(slot in active_slots) if isinstance(active_slots, set) else active_slots.get(slot, 0)
+        lane = (slot, int(row.get("credential_lane", 1)))
+        if (count < capacities.get(slot, 1) and lane not in (active_lanes or set())
+                and (admission is None or admission(row))):
+            return row
+        queue.append(row)
+    return None
+
+
+def _turn_score(turn: dict):
+    return turn.get("turn_score", turn.get("final_score", turn.get("score")))
+
+
+def _report_condition(report: dict, turns: list[dict]):
+    condition = report.get("condition", report.get("run_condition"))
+    turn_conditions = {turn.get("condition") for turn in turns if turn.get("condition")}
+    if len(turn_conditions) > 1:
+        return "__mixed__"
+    if condition and turn_conditions and condition not in turn_conditions:
+        return "__mixed__"
+    return condition or (next(iter(turn_conditions)) if turn_conditions else None)
+
+
+def learning_continuity_prefix(row):
+    """An unresolved local audit hold permits only its already-validated prefix."""
+    marker = Path(row['output']) / '_learning_continuity_hold.json'
+    if not marker.exists():
+        return None
+    try:
+        hold = load(marker)
+        if hold.get('status') == 'resolved':
+            return None
+        prefix = hold['valid_prefix_turns']
+        if type(prefix) is not int or prefix < 0:
+            raise ValueError('invalid learning continuity prefix')
+        return prefix
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return 0  # Corrupt audit metadata cannot enable aggregation or replay.
+
+
+def _report_matches_row(row: dict, report: dict) -> bool:
+    turns = report.get("turns", [])
+    valid_prefix = learning_continuity_prefix(row)
+    if valid_prefix is not None and len(turns) > valid_prefix:
+        return False
+    if report.get("stream_id", report.get("flow_id")) != row["flow_id"]:
+        return False
+    if [turn.get("turn_id") for turn in turns] != row["turns"]:
+        return False
+    if report.get("error") or report.get("cleanup_error"):
+        return False
+    if report.get("baseline", row["agent"]) != row["agent"]:
+        return False
+    if row["level"] == "l1" and row.get("condition") != _report_condition(report, turns):
+        return False
+    if row["level"] == "l2":
+        run_configuration = report.get("run_configuration", {})
+        if isinstance(run_configuration, dict) and run_configuration.get("budget_profile", "formal") != "formal":
+            return False
+        if row.get("panel_id"):
+            if not isinstance(run_configuration, dict):
+                return False
+            if run_configuration.get("panel_id") != row.get("panel_id"):
+                return False
+            if run_configuration.get("panel_manifest_sha256") != row.get("panel_manifest_sha256"):
+                return False
+            if run_configuration.get("selected_stream_ids") != row.get("selected_stream_ids"):
+                return False
+        for field in ("pool_id", "pool_manifest_sha256", "package_manifest_sha256", "runtime_profiles_sha256"):
+            if row.get(field) is not None and run_configuration.get(field) != row[field]:
+                return False
+        condition = _report_condition(report, turns)
+        # Reports produced before the condition field existed are evolving runs.
+        if condition is None:
+            if row.get("condition") != "evolving":
+                return False
+        elif condition != row.get("condition"):
+            return False
+    for turn in turns:
+        if turn.get("final_category") == "error":
+            return False
+        if turn.get("evaluation_status") == "evaluation_error":
+            return False
+        if type(turn.get("passed")) is not bool:
+            return False
+        score = _turn_score(turn)
+        if type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
+            return False
+    return True
+
+
+def report_for(row):
+    output = Path(row["output"])
+    candidates = list(output.glob("*/summary.json")) if row["level"] == "l1" else list(output.glob("*/*/report.json"))
+    for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+        report = load(path)
+        if _report_matches_row(row, report):
+            return path, report
+    return None, None
+
+
+def report_for_interrupted_retry(row, stop_after_turn):
+    output = Path(row["output"])
+    if stop_after_turn not in row["turns"]:
+        return None, None
+    end = row["turns"].index(stop_after_turn) + 1
+    prefix = {**row, "turns": row["turns"][:end]}
+    for path in sorted(output.glob("*/*/report.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        report = load(path)
+        if report.get("stopped_after_turn") == stop_after_turn and _report_matches_row(prefix, report):
+            return path, report
+    return None, None
+
+
+def latest_checkpoint(row):
+    if learning_continuity_prefix(row) is not None:
+        raise ValueError('unresolved learning continuity hold; no automatic rollback or paid replay')
+    candidates = []
+    unsafe_frontier = (-1, 0)
+    for path in (Path(row["output"]) / "_checkpoints").rglob("checkpoint.json"):
+        data = load(path)
+        if data.get("invalidated"):
+            continue
+        if data.get("stream_id", data.get("flow_id")) != row["flow_id"]:
+            continue
+        if row["level"] == "l1" and data.get("condition") != row.get("condition"):
+            continue
+        if row["level"] == "l2":
+            checkpoint_condition = data.get("condition", data.get("run_condition"))
+            if checkpoint_condition is None:
+                if row.get("condition") != "evolving":
+                    continue
+            elif checkpoint_condition != row.get("condition"):
+                continue
+            if row.get("panel_id"):
+                if data.get("panel_id") != row.get("panel_id"):
+                    continue
+                if data.get("panel_manifest_sha256") != row.get("panel_manifest_sha256"):
+                    continue
+                if data.get("selected_stream_ids") != row.get("selected_stream_ids"):
+                    continue
+            if data.get("phase") == "interact_started":
+                if _started_marker_has_same_run_pending(row, path.parent, data):
+                    continue
+                unsafe_frontier = max(
+                    unsafe_frontier,
+                    (int(data.get("next_turn_index", 0)), 2),
+                )
+                continue
+        if all((path.parent / name).is_file() for name in ("workspace.zip", "baseline_state.zip", "completed_turns.json")):
+            index = int(data["next_turn_index"])
+            pending = data.get("phase") == "adjudicate"
+            if row["level"] == "l2":
+                position = (index, int(pending))
+                try:
+                    turns = load(path.parent / "completed_turns.json")
+                    prefix = {**row, "turns": row["turns"][:index]}
+                    report = {"stream_id": row["flow_id"], "condition": checkpoint_condition, "turns": turns,
+                              "run_configuration": {field: data[field] for field in (
+                                  "panel_id", "panel_manifest_sha256", "selected_stream_ids",
+                                  "pool_id", "pool_manifest_sha256", "package_manifest_sha256",
+                                  "runtime_profiles_sha256") if field in data}}
+                    if not (0 <= index <= len(row["turns"]) and isinstance(turns, list)
+                            and len(turns) == index and _report_matches_row(prefix, report)):
+                        # An errored final Turn is not completed progress. Its
+                        # saved adjudication reply is the earliest safe resume.
+                        if isinstance(turns, list) and any(
+                            isinstance(turn, dict) and (turn.get("evaluation_status") == "evaluation_error"
+                                                       or _turn_score(turn) is None)
+                            for turn in turns
+                        ):
+                            position = (max(0, index - 1), 1)
+                        raise ValueError("invalid completed prefix")
+                    if pending:
+                        evidence = load(path.parent / "evidence.json")
+                        if not (index < len(row["turns"]) and isinstance(evidence, dict)
+                                and evidence.get("turn_id") == row["turns"][index]
+                                and evidence.get("turn_index") == index
+                                and isinstance(evidence.get("reply"), dict)):
+                            raise ValueError("invalid adjudication evidence")
+                except (OSError, ValueError, TypeError, AttributeError):
+                    unsafe_frontier = max(unsafe_frontier, position)
+                    continue
+            stage = int(pending) if row["level"] == "l2" else 0
+            candidates.append((index, stage, path.stat().st_mtime, path.parent))
+    selected = max(candidates) if candidates else None
+    if row["level"] == "l2" and unsafe_frontier > (selected[:2] if selected else (-1, 0)):
+        raise ValueError("no safe L2 checkpoint preserves the latest Agent execution; inspect saved adjudication evidence")
+    return selected[3] if selected else None
+
+
+def _run_dir_for_retry(row, value):
+    candidate = Path(value).expanduser()
+    if candidate.exists():
+        run_dir = candidate.resolve()
+        if run_dir.is_file():
+            run_dir = run_dir.parent
+    else:
+        matches = [
+            path.parent
+            for path in Path(row["output"]).glob(f"{row['flow_id']}/{value}/report.json")
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"retry run not found or ambiguous under row output: {value}")
+        run_dir = matches[0].resolve()
+    output = Path(row["output"]).resolve()
+    if output != run_dir and output not in run_dir.parents:
+        raise ValueError("retry run path is outside the selected row output")
+    return run_dir
+
+
+def _checkpoint_preserves_prefix(row, checkpoint, expected_index):
+    checkpoint = Path(checkpoint).resolve()
+    output = Path(row["output"]).resolve()
+    if output != checkpoint and output not in checkpoint.parents:
+        raise ValueError("retry checkpoint path is outside the selected row output")
+    if not all((checkpoint / name).is_file() for name in ("workspace.zip", "baseline_state.zip", "completed_turns.json")):
+        raise ValueError("retry checkpoint is missing required archives")
+    data = load(checkpoint / "checkpoint.json")
+    if data.get("invalidated"):
+        raise ValueError("retry checkpoint is invalidated")
+    if data.get("non_resumable"):
+        raise ValueError("retry checkpoint is non-resumable")
+    turns = load(checkpoint / "completed_turns.json")
+    condition = data.get("condition", data.get("run_condition"))
+    # V5 report matching reads immutable package/pool/panel identity from
+    # run_configuration. Carry the checkpoint's values, never the row's, so
+    # mismatched bindings still fail closed during prefix validation.
+    report = {"stream_id": row["flow_id"], "condition": condition, "turns": turns,
+              "run_configuration": dict(data)}
+    prefix = {**row, "turns": row["turns"][:expected_index]}
+    if data.get("stream_id", data.get("flow_id")) != row["flow_id"]:
+        raise ValueError("retry checkpoint stream identity mismatch")
+    if data.get("baseline", row["agent"]) != row["agent"]:
+        raise ValueError("retry checkpoint baseline identity mismatch")
+    if condition != row.get("condition"):
+        raise ValueError("retry checkpoint condition mismatch")
+    if row.get("panel_id"):
+        if data.get("panel_id") != row.get("panel_id"):
+            raise ValueError("retry checkpoint panel identity mismatch")
+        if data.get("panel_manifest_sha256") != row.get("panel_manifest_sha256"):
+            raise ValueError("retry checkpoint panel manifest mismatch")
+        if data.get("selected_stream_ids") != row.get("selected_stream_ids"):
+            raise ValueError("retry checkpoint panel stream selection mismatch")
+    if int(data.get("next_turn_index", -1)) != expected_index:
+        raise ValueError("retry checkpoint turn frontier mismatch")
+    if not (isinstance(turns, list) and len(turns) == expected_index and _report_matches_row(prefix, report)):
+        raise ValueError("retry checkpoint does not preserve the completed prefix")
+
+
+def _find_completed_prefix_checkpoint(row, expected_index):
+    candidates = []
+    for path in (Path(row["output"]) / "_checkpoints").rglob("checkpoint.json"):
+        data = load(path)
+        if data.get("phase") in {"adjudicate", "interact_started"}:
+            continue
+        if int(data.get("next_turn_index", -1)) != expected_index:
+            continue
+        try:
+            _checkpoint_preserves_prefix(row, path.parent, expected_index)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        candidates.append((path.stat().st_mtime, path.parent))
+    return max(candidates)[1] if candidates else None
+
+
+def completed_target_evidence(row, turn_id):
+    """Any valid completed history under this primary output blocks paid replay.
+
+    A stale failed run is not permission to retry a Turn completed by another
+    preserved run. This examines all local histories, not only failed_run_id.
+    """
+    index = row["turns"].index(turn_id)
+    output = Path(row["output"])
+    reports = output.glob("*/summary.json") if row["level"] == "l1" else output.glob("*/*/report.json")
+    for path in reports:
+        try:
+            report = load(path)
+            turns = report.get("turns", [])
+            if not isinstance(turns, list) or not index < len(turns) <= len(row["turns"]):
+                continue
+            if row["level"] == "l2" and _valid_timeout_recovery_receipt(path.parent, report, turn_id, index):
+                continue  # A separately proven legacy no-execution placeholder.
+            clean = {**report, "error": None, "cleanup_error": None}
+            if _report_matches_row({**row, "turns": row["turns"][:len(turns)]}, clean):
+                return {"source": str(path), "kind": "completed_report_prefix", "turn_id": turn_id}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    for path in (output / "_checkpoints").rglob("checkpoint.json"):
+        try:
+            meta = load(path)
+            count = meta.get("next_turn_index", -1)
+            if type(count) is not int or not index < count <= len(row["turns"]):
+                continue
+            _checkpoint_preserves_prefix(row, path.parent, count)
+            return {"source": str(path.parent), "kind": "completed_checkpoint_prefix", "turn_id": turn_id}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return None
+
+
+def preserved_target_reply(row, turn_id, minimum_interaction):
+    index = row["turns"].index(turn_id)
+    for path in (Path(row["output"]) / "_checkpoints").rglob("checkpoint.json"):
+        try:
+            meta = load(path)
+            kind = meta.get("phase")
+            if meta.get("invalidated") or kind not in {"adjudicate", "reply_received"}:
+                continue
+            if meta.get("turn_id") != turn_id or meta.get("next_turn_index") != index:
+                continue
+            interaction = meta.get("interaction_index")
+            if type(interaction) is not int or interaction < minimum_interaction:
+                continue
+            if meta.get("stream_id", meta.get("flow_id")) != row["flow_id"] or meta.get("baseline", row["agent"]) != row["agent"]:
+                continue
+            prefix = load(path.parent / "completed_turns.json")
+            report = {"stream_id": row["flow_id"], "condition": meta.get("condition"), "turns": prefix, "run_configuration": dict(meta)}
+            if not _report_matches_row({**row, "turns": row["turns"][:index]}, report):
+                continue
+            evidence = load(path.parent / ("evidence.json" if kind == "adjudicate" else "reply_received.json"))
+            if isinstance(evidence.get("reply"), dict):
+                return {"source": str(path.parent), "kind": kind, "interaction_index": interaction}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return None
+
+
+def _find_interrupted_checkpoint(row, run_id, turn_id):
+    if completed_target_evidence(row, turn_id) is not None:
+        raise ValueError("interrupted retry target already has completed evidence; no paid replay")
+    expected_index = row["turns"].index(turn_id)
+    candidates = []
+    saved_adjudication = False
+    for path in (Path(row["output"]) / "_checkpoints").rglob("checkpoint.json"):
+        data = load(path)
+        if data.get("phase") != "interact_started":
+            if (
+                data.get("phase") == "adjudicate"
+                and data.get("run_id") == run_id
+                and data.get("turn_id") == turn_id
+                and int(data.get("next_turn_index", -1)) == expected_index
+                and (path.parent / "evidence.json").exists()
+            ):
+                saved_adjudication = True
+            continue
+        if data.get("run_id") != run_id or data.get("turn_id") != turn_id:
+            continue
+        if int(data.get("next_turn_index", -1)) != expected_index:
+            continue
+        interaction_index = int(data.get("interaction_index", -1))
+        if interaction_index < 1:
+            continue
+        candidates.append((interaction_index, path.stat().st_mtime, path.parent, data))
+    if not candidates:
+        if saved_adjudication:
+            raise ValueError("interrupted retry has saved adjudication evidence")
+        return None
+    interaction_index, _, interrupted, marker = max(candidates)
+    saved_reply = preserved_target_reply(row, turn_id, interaction_index)
+    if saved_reply is not None:
+        kind = "reply_received" if saved_reply["kind"] == "reply_received" else "adjudication"
+        raise ValueError(f"interrupted retry has saved {kind} evidence in a preserved run")
+    target_pending = interrupted.parent / f"p{expected_index:04d}-{interaction_index:02d}"
+    target_received = interrupted.parent / f"r{expected_index:04d}-{interaction_index:02d}"
+    if marker.get("invalidated") or target_pending.exists():
+        raise ValueError("interrupted retry has saved adjudication evidence")
+    if target_received.exists():
+        raise ValueError("interrupted retry has saved reply_received evidence")
+    _checkpoint_preserves_prefix(row, interrupted, expected_index)
+    if interaction_index == 1:
+        return interrupted, interrupted, interaction_index
+
+    # A later Interaction can be retried only by rewinding to the immediately
+    # preceding durable adjudication checkpoint. That checkpoint contains the
+    # already-paid Agent reply but predates Judge/Simulator work, so resuming it
+    # re-adjudicates the saved reply, regenerates the follow-up, and calls the
+    # Agent only for the unfinished Interaction.
+    pending = interrupted.parent / f"p{expected_index:04d}-{interaction_index - 1:02d}"
+    metadata_path = pending / "checkpoint.json"
+    evidence_path = pending / "evidence.json"
+    if not (metadata_path.is_file() and evidence_path.is_file()):
+        raise ValueError("later interrupted retry requires the preceding adjudication checkpoint")
+    metadata = load(metadata_path)
+    evidence = load(evidence_path)
+    _checkpoint_preserves_prefix(row, pending, expected_index)
+    if not (
+        metadata.get("phase") == "adjudicate"
+        and metadata.get("run_id") == run_id
+        and metadata.get("turn_id") == turn_id
+        and int(metadata.get("interaction_index", -1)) == interaction_index - 1
+        and evidence.get("turn_id") == turn_id
+        and int(evidence.get("turn_index", -1)) == expected_index
+        and int(evidence.get("interaction_index", -1)) == interaction_index - 1
+        and isinstance(evidence.get("request"), str)
+        and isinstance(evidence.get("reply"), dict)
+        and isinstance(evidence.get("history"), list)
+        and isinstance(evidence.get("interactions"), list)
+        and len(evidence["interactions"]) == interaction_index - 2
+        and isinstance(evidence.get("before_files"), dict)
+    ):
+        raise ValueError("later interrupted retry preceding adjudication evidence mismatch")
+    return pending, interrupted, interaction_index
+
+
+def _started_marker_has_same_run_pending(row, checkpoint, data):
+    turn_id = data.get("turn_id")
+    turn_index = int(data.get("next_turn_index", -1))
+    interaction_index = int(data.get("interaction_index", -1))
+    if not (0 <= turn_index < len(row["turns"]) and row["turns"][turn_index] == turn_id):
+        return False
+    pending = Path(checkpoint).parent / f"p{turn_index:04d}-{interaction_index:02d}"
+    metadata_path = pending / "checkpoint.json"
+    evidence_path = pending / "evidence.json"
+    if not (metadata_path.is_file() and evidence_path.is_file()):
+        return False
+    if not all((pending / name).is_file() for name in ("workspace.zip", "baseline_state.zip", "completed_turns.json")):
+        return False
+    try:
+        metadata = load(metadata_path)
+        evidence = load(evidence_path)
+        _checkpoint_preserves_prefix(row, pending, turn_index)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return (
+        metadata.get("phase") == "adjudicate"
+        and metadata.get("stream_id") == row["flow_id"]
+        and metadata.get("condition") == row.get("condition")
+        and metadata.get("panel_id") == row.get("panel_id")
+        and metadata.get("panel_manifest_sha256") == row.get("panel_manifest_sha256")
+        and metadata.get("selected_stream_ids") == row.get("selected_stream_ids")
+        and metadata.get("run_id") == data.get("run_id")
+        and metadata.get("turn_id") == turn_id
+        and int(metadata.get("next_turn_index", -1)) == turn_index
+        and int(metadata.get("interaction_index", -1)) == interaction_index
+        and evidence.get("turn_id") == turn_id
+        and evidence.get("turn_index") == turn_index
+        and int(evidence.get("interaction_index", -1)) == interaction_index
+        and isinstance(evidence.get("reply"), dict)
+    )
+
+
+def _started_marker_has_same_run_reply_evidence(checkpoint, data):
+    """Fail closed when the same Interaction may already have returned a reply."""
+    turn_index = int(data.get("next_turn_index", -1))
+    interaction_index = int(data.get("interaction_index", -1))
+    received = Path(checkpoint).parent / f"r{turn_index:04d}-{interaction_index:02d}"
+    # The r* directory is written only after interact() returns. Even a partial
+    # or corrupt marker means replay safety is unknown, so do not let missing
+    # JSON weaken the one-shot retry boundary.
+    return (received / "checkpoint.json").exists() or (
+        received / "reply_received.json"
+    ).exists()
+
+
+def _valid_timeout_recovery_receipt(run_dir, report, turn_id, target_index):
+    receipt_path = Path(run_dir) / "timeout-recovery.json"
+    if not receipt_path.is_file():
+        return False
+    try:
+        receipt = load(receipt_path)
+    except (OSError, ValueError, TypeError):
+        return False
+    turns = report.get("turns", [])
+    if not (isinstance(turns, list) and len(turns) > target_index and isinstance(turns[target_index], dict)):
+        return False
+    target = turns[target_index]
+    return (
+        receipt.get("status") == "admitted"
+        and receipt.get("turn_id") == turn_id
+        and int(receipt.get("turn_index", -1)) == target_index + 1
+        and Path(str(receipt.get("source_report", ""))).resolve() == (Path(run_dir) / "report.json").resolve()
+        and str(receipt.get("checkpoint", ""))
+        and str(report.get("error", "")) == "recovered_interact_timeout: admitted as execution_limit; resume from checkpoint"
+        and target.get("turn_id") == turn_id
+        and target.get("final_category") == "execution_limit"
+        and target.get("evaluation_status") == "failed"
+        and target.get("turn_score") == 0.0
+        and target.get("evolution", {}).get("completed") is False
+        and {"type": "evolution.skipped", "reason": "runtime_unavailable"} in target.get("evolution", {}).get("events", [])
+    )
+
+
+def prepare_interrupted_retry(row, retry_run, authorization_path):
+    if learning_continuity_prefix(row) is not None:
+        raise ValueError('unresolved learning continuity hold; recovery protocol review required')
+    if row["level"] != "l2":
+        raise ValueError("interrupted retry is only supported for L2 rows")
+    if row.get("condition") not in {"reset", "frozen", "evolving"}:
+        raise ValueError(
+            "interrupted retry is only supported for reset, frozen or evolving L2 rows"
+        )
+    if authorization_path is None:
+        raise ValueError("--retry-authorization is required with --retry-interrupted-run")
+    auth_path = Path(authorization_path).resolve()
+    auth = load(auth_path)
+    if auth.get("status") != "authorized_not_consumed":
+        raise ValueError("interrupted retry authorization is already consumed or invalid")
+    if auth.get("job") != row["id"]:
+        raise ValueError("interrupted retry authorization job mismatch")
+    if int(auth.get("allowed_additional_attempts", 0)) != 1:
+        raise ValueError("interrupted retry authorization must allow exactly one attempt")
+    if auth.get("orphaned_interaction_proof"):
+        raise ValueError("This checkpoint requires the original historical recovery environment.")
+    run_dir = _run_dir_for_retry(row, retry_run)
+    report = load(run_dir / "report.json")
+    run_id = str(report.get("run_id", ""))
+    turn_id = str(auth.get("turn_id", ""))
+    if run_id != str(auth.get("failed_run_id", "")):
+        raise ValueError("interrupted retry authorization failed_run_id mismatch")
+    if report.get("stream_id") != row["flow_id"] or report.get("baseline") != row["agent"]:
+        raise ValueError("interrupted retry report identity mismatch")
+    if _report_condition(report, report.get("turns", [])) != row.get("condition"):
+        raise ValueError("interrupted retry report condition mismatch")
+    if turn_id not in row["turns"]:
+        raise ValueError("interrupted retry turn is not in the selected row")
+    target_index = row["turns"].index(turn_id)
+    turns = report.get("turns", [])
+    if _report_matches_row(row, report):
+        raise ValueError("interrupted retry would replay a valid completed report")
+    valid_receipt = _valid_timeout_recovery_receipt(run_dir, report, turn_id, target_index)
+    if len(turns) > target_index and not valid_receipt:
+        raise ValueError("interrupted retry would replay an already recorded turn")
+    recovery = _find_interrupted_checkpoint(row, run_id, turn_id)
+    interrupted_checkpoint = None
+    retry_interaction_index = None
+    if recovery is None:
+        if row.get("condition") in {"frozen", "evolving"}:
+            raise ValueError(
+                "persistent-condition interrupted retry requires an exact interact_started checkpoint"
+            )
+        preserve_valid_turns = auth.get("preserve_valid_turns", [])
+        if not isinstance(preserve_valid_turns, list) or len(preserve_valid_turns) != target_index:
+            raise ValueError("legacy interrupted retry requires an authorized completed prefix")
+        if str(report.get("error", "")) != "BaselineProtocolError: baseline adapter timed out during interact" and not valid_receipt:
+            raise ValueError("interrupted retry report is not an interact interruption")
+        checkpoint = _find_completed_prefix_checkpoint(row, target_index)
+        if checkpoint is None:
+            raise ValueError("no exact completed-prefix checkpoint for interrupted retry")
+    else:
+        checkpoint, interrupted_checkpoint, retry_interaction_index = recovery
+    consumed = {
+        **auth,
+        "status": "consumed",
+        "consumed_at": now(),
+        "consumed_by_pid": os.getpid(),
+        "checkpoint": str(checkpoint),
+        "source_run_dir": str(run_dir),
+        "job": row["id"],
+        "stream_id": row["flow_id"],
+        "baseline": row["agent"],
+        "condition": row["condition"],
+    }
+    if interrupted_checkpoint is not None:
+        consumed["interrupted_checkpoint"] = str(interrupted_checkpoint)
+        consumed["retry_interaction_index"] = retry_interaction_index
+    save(auth_path, consumed)
+    return checkpoint, run_id, turn_id
+
+
+def command(repo, row, checkpoint, config_dir=None, *, retry_interrupted_run=None, retry_authorization=None, stop_after_turn=None):
+    fresh_authorization = Path(row["output"]) / "fresh_run_authorization.json"
+    if fresh_authorization.exists() and checkpoint is None:
+        raise ValueError("This authorization requires the original historical recovery environment.")
+    if checkpoint and (Path(checkpoint) / "checkpoint.json").is_file():
+        metadata = load(Path(checkpoint) / "checkpoint.json")
+        if metadata.get("phase") == "adjudicate" and completed_target_evidence(row, metadata.get("turn_id")) is not None:
+            raise ValueError("saved adjudication target already has completed evidence; no regrading")
+        if metadata.get("scored_exception_ledger"):
+            raise ValueError("This checkpoint requires the original historical recovery environment.")
+    config_root = Path(config_dir or repo)
+    if any(row.get(key) for key in ("verifier_grade_authorization", "input_repair_authorization", "completion_transaction_authorization")):
+        raise ValueError("This authorization requires the original historical recovery environment.")
+    if row["agent"] == "hermes":
+        config = f"tmp_hermes_cf_{row['level']}.override.json"
+    elif row["agent"] in {"skillopt", "trace2skill"} and row["level"] == "l2":
+        config = f"tmp_{row['agent']}_docker_l2.override.json"
+        if not (config_root / config).is_file():
+            config = f"tmp_{row['agent']}_docker.override.json"
+    else:
+        config = f"tmp_{row['agent']}_docker.override.json"
+    # Stream length must not silently determine the per-turn resource allowance.
+    # This is an aggregate guard; model/tool/time limits remain unchanged.
+    # This is a runaway guard, not a scientific per-Turn budget. Cached context
+    # and explicit turn-boundary evolution can make a legal SkillsBench Turn
+    # exceed 5M accounted tokens even though its model/tool/output limits hold.
+    # Keep broad aggregate headroom so this secondary fuse does not become an
+    # accidental admission limit; per-Turn limits remain the comparable runtime
+    # contract and still bound every individual episode.
+    stream_token_limit = max(10_000_000, 10_000_000 * len(row["turns"]))
+    args = [sys.executable, "-m", f"evolink_bench.{row['level']}_" + ("arena_compat" if row["level"] == "l1" else "compat"),
+            "--package", row["package"], "--stream", row["stream"], "--output", row["output"],
+            "--baseline", row["agent"], "--baseline-config", str(config_root / config),
+            "--max-total-tokens", str(stream_token_limit)]
+    if row["level"] == "l1":
+        args += ["--turns", ",".join(row["turns"]), "--backend", "docker", "--image", "evolink-ubuntu:22.04"]
+        if row.get('completion_transaction_authorization'):
+            args += ['--capture-interaction-recovery']
+        if row.get("condition"):
+            args += ["--condition", row["condition"]]
+    else:
+        args += ["--condition", row["condition"], "--image", "evolink-l2:0.1", "--browser-image", "evolink-l2-browser:0.1", "--allow-generated-code"]
+    if checkpoint:
+        args += ["--resume-checkpoint", str(checkpoint)]
+    if retry_interrupted_run:
+        args += ["--retry-interrupted-run", str(retry_interrupted_run)]
+    if retry_authorization:
+        args += ["--retry-authorization", str(retry_authorization)]
+    if retry_interrupted_run:
+        args += ["--retry-job", row["id"]]
+    if row.get("panel_id"):
+        args += [
+            "--panel-id", row["panel_id"],
+            "--panel-manifest-sha256", row["panel_manifest_sha256"],
+            "--panel-streams", ",".join(row["selected_stream_ids"]),
+        ]
+    if stop_after_turn:
+        args += ["--stop-after-turn", str(stop_after_turn)]
+    for field in ("pool_id", "pool_manifest_sha256", "package_manifest_sha256", "runtime_profiles_sha256"):
+        if row.get(field) is not None:
+            args += ["--" + field.replace("_", "-"), row[field]]
+    from tools.saved_judge_canary_adoption import bound_command
+    return bound_command(row, checkpoint, args)
+
+
+def l2_reports_to_aggregation_records(report_rows):
+    records = []
+    seen_conditions = set()
+    for row, report in report_rows:
+        if row.get("level") != "l2":
+            continue
+        turns = report.get("turns", [])
+        if not _report_matches_row(row, report):
+            raise ValueError(f"report does not match row: {row.get('id')}")
+        condition = row.get("condition")
+        seen_conditions.add(condition)
+        roles = row.get("turn_roles", {})
+        for index, turn in enumerate(turns, 1):
+            turn_id = str(turn["turn_id"])
+            stream_id = str(turn.get("stream_id", row["flow_id"]))
+            if stream_id != row["flow_id"]:
+                raise ValueError(f"stream identity mismatch for {row.get('id')}/{turn_id}")
+            sequence_role = turn.get("sequence_role", roles.get(turn_id))
+            if not sequence_role:
+                raise ValueError(f"missing sequence_role for {row.get('id')}/{turn_id}")
+            v5_record = {}
+            if row.get("pool_id"):
+                v5_record = {field: row[field] for field in (
+                    "pool_id", "pool_manifest_sha256", "package_manifest_sha256", "runtime_profiles_sha256",
+                )}
+                v5_record.update({field: turn.get(field) for field in (
+                    "source_task_id", "runtime_profile_id", "runtime_profile_digest",
+                )})
+                v5_record["effective_work_limits_digest"] = hashlib.sha256(
+                    json.dumps(turn.get("effective_work_limits"), sort_keys=True).encode()
+                ).hexdigest()
+            records.append({
+                "condition": condition,
+                "panel_id": row.get("panel_id"),
+                "panel_manifest_sha256": row.get("panel_manifest_sha256"),
+                "stream_id": stream_id,
+                "turn_id": turn_id,
+                "turn_index": int(turn.get("turn_index", index)),
+                "sequence_role": sequence_role,
+                "turn_score": float(_turn_score(turn)),
+                "evaluation_status": turn.get("evaluation_status", "scored"),
+                **v5_record,
+            })
+    missing = set(L2_CONDITIONS) - seen_conditions
+    if missing:
+        raise ValueError(f"missing required L2 condition report(s): {sorted(missing)}")
+    return records
+
+
+def matched_l2_aggregations(rows):
+    """Return formal matched aggregates only for fully completed baseline cells."""
+
+    from evolink_bench.evolution_aggregation import aggregate_matched_runs
+
+    panels = {row.get("panel_id") for row in rows if row["level"] == "l2"}
+    if len(panels) > 1:
+        return {panel: matched_l2_aggregations([row for row in rows if row["level"] == "l2" and row.get("panel_id") == panel])
+                for panel in sorted(panels, key=lambda value: value or "")}
+
+    result = {}
+    for agent in dict.fromkeys(row["agent"] for row in rows):
+        selected = [row for row in rows if row["level"] == "l2" and row["agent"] == agent]
+        if len({row.get("panel_id") for row in selected}) > 1:
+            continue
+        if {row.get("condition") for row in selected} != set(L2_CONDITIONS):
+            continue
+        report_rows = []
+        for row in selected:
+            _, report = report_for(row)
+            if report is None:
+                break
+            report_rows.append((row, report))
+        else:
+            profiles = {
+                turn.get("timing_profile", "dataset")
+                for _, report in report_rows for turn in report.get("turns", [])
+            }
+            if len(profiles) > 1:
+                # Recovery may preserve completed results from the old 900s
+                # profile. Do not label mixed timing budgets as matched gain.
+                continue
+            result[agent] = aggregate_matched_runs(
+                l2_reports_to_aggregation_records(report_rows),
+                require_panel_binding=bool(selected[0].get("panel_id")),
+            )
+    return result
+
+
+def matrix(rows):
+    cells = []
+    for agent in dict.fromkeys(row["agent"] for row in rows):
+        datasets = list(dict.fromkeys((row["level"], row.get("condition"), row.get("panel_id")) for row in rows))
+        for level, condition, panel in datasets:
+            selected = [row for row in rows if row["agent"] == agent and row["level"] == level and row.get("condition") == condition and row.get("panel_id") == panel]
+            if not selected:
+                continue
+            scores = []
+            passed = 0
+            for row in selected:
+                _, report = report_for(row)
+                if report:
+                    for turn in report["turns"]:
+                        scores.append(float(_turn_score(turn)))
+                        passed += bool(turn.get("passed"))
+            dataset = level if condition is None else f"{level}:{condition}"
+            cells.append({"agent": agent, "dataset": dataset, "condition": condition, "panel_id": panel, "completed_turns": len(scores),
+                          "expected_turns": sum(len(row["turns"]) for row in selected), "passed_turns": passed,
+                          "mean_score": sum(scores) / len(scores) if scores else None})
+    return cells
+
+
+class AdoptedProcess:
+    """Track a verified existing worker without signaling or replaying it."""
+    def __init__(self, row):
+        self.pid = int(row["pid"])
+        if "process_start_ticks" not in row:
+            raise ValueError("adopted worker receipt missing process_start_ticks")
+        self.started = str(row["process_start_ticks"])
+        if sys.platform == "darwin":
+            result = subprocess.run(["ps", "-p", str(self.pid), "-o", "command="],
+                                    capture_output=True, text=True, timeout=5)
+            cmd = [item.encode() for item in shlex.split(result.stdout)] if result.returncode == 0 else []
+        else:
+            cmd = Path(f"/proc/{self.pid}/cmdline").read_bytes().split(b"\0")
+        if not {b"evolink_bench.l2_compat", b"evolink_bench.l1_arena_compat"}.intersection(cmd) or str(row["output"]).encode() not in cmd:
+            raise ValueError("adopted process identity mismatch")
+        if self.poll() is not None:
+            raise ValueError("adopted worker is no longer running")
+
+    def poll(self):
+        if sys.platform == "darwin":
+            return None if process_start_ticks(self.pid) == self.started else 0
+        try:
+            fields = Path(f"/proc/{self.pid}/stat").read_text().rsplit(")", 1)[1].split()
+        except FileNotFoundError:
+            return 0  # Success still requires a complete matching report.
+        return None if fields[0] != "Z" and fields[19] == self.started else 0
+
+
+def process_start_ticks(pid):
+    if sys.platform == "darwin":
+        result = subprocess.run(["ps", "-p", str(int(pid)), "-o", "lstart=", "-o", "stat="],
+                                capture_output=True, text=True, timeout=5)
+        value = result.stdout.strip().rsplit(None, 1)
+        if result.returncode or len(value) != 2 or value[1].startswith("Z"):
+            return None
+        return "darwin:" + value[0].strip()
+    if os.name != "posix":
+        return None
+    try:
+        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
+    if not fields or fields[0] == "Z":
+        return None
+    return fields[19] if len(fields) > 19 else None
+
+
+def storage_gate_from_environment():
+    if os.environ.get("TRIEVO_STORAGE_GUARD") != "1":
+        return None
+    from evolink_bench.storage_recovery import StorageGate
+    return StorageGate.from_environment()
+
+
+def _log_tail(path, limit=16384):
+    try:
+        data = Path(path).read_bytes()
+    except (OSError, TypeError):
+        return ""
+    return data[-limit:].decode("utf-8", errors="replace")
+
+
+def _storage_error_text(row):
+    return " ".join(
+        str(value) for value in (
+            row.get("error"),
+            row.get("storage_error"),
+            _log_tail(row.get("log")),
+        )
+    )
+
+
+def _is_storage_error(row, storage_gate=None):
+    text = _storage_error_text(row)
+    checker = getattr(storage_gate, "is_storage_error", None) if storage_gate is not None else None
+    if callable(checker):
+        return bool(checker(text))
+    from evolink_bench.storage_recovery import is_storage_error
+    return is_storage_error(text)
+
+
+def _storage_error_summary(row):
+    text = " ".join(
+        str(value) for value in (
+            row.get("error"),
+            row.get("storage_error"),
+            _log_tail(row.get("log"), limit=2000),
+        )
+    ).strip()
+    return text[:1000] if text else "storage-related worker failure"
+
+
+def _has_completed_turns(row):
+    output = Path(row["output"])
+    return any(path.is_file() for path in output.glob("_checkpoints/**/completed_turns.json"))
+
+
+def _has_any_checkpoint_history(row):
+    output = Path(row["output"])
+    checkpoint_root = output / "_checkpoints"
+    return checkpoint_root.exists() and any(checkpoint_root.rglob("*"))
+
+
+def _is_pre_model_initialization_storage_failure(row):
+    text = _storage_error_text(row)
+    return (
+        "_start_taskstream_volume_transport" in text
+        and not _has_any_checkpoint_history(row)
+    )
+
+
+def _defer_storage_recovery(row, storage_retry_limit, allow_pre_model_initialization=False):
+    retry_count = int(row.get("retry_count", 0))
+    if retry_count >= storage_retry_limit:
+        row.update(status="needs_attention", recovery_reason="storage retry limit exceeded")
+        return False
+    try:
+        checkpoint = latest_checkpoint(row)
+        recovery_mode = "checkpoint"
+    except Exception as error:
+        row["recovery_error"] = str(error)
+        row.update(status="blocked_recovery", recovery_reason="unsafe storage recovery checkpoint")
+        return False
+    if checkpoint is None and not allow_pre_model_initialization:
+        row.update(status="blocked_recovery", recovery_reason="missing safe storage recovery checkpoint")
+        return False
+    if checkpoint is None and allow_pre_model_initialization:
+        recovery_mode = "pre_model_initialization"
+    row["retry_count"] = retry_count + 1
+    row["checkpoint"] = str(checkpoint) if checkpoint else None
+    row["status"] = "deferred_storage"
+    row["recovery_mode"] = recovery_mode
+    row.setdefault("attempt_history", []).append({
+        "event": "deferred_storage",
+        "at": now(),
+        "retry_count": row["retry_count"],
+        "checkpoint": row["checkpoint"],
+    })
+    return True
+
+
+def _has_matching_report(row):
+    try:
+        return report_for(row)[1] is not None
+    except Exception:
+        return False
+
+
+def _prepare_recovered_storage_rows(selected, storage_gate, storage_retry_limit):
+    if storage_gate is None:
+        return
+    for row in selected:
+        if row.get("status") != "paused_error" or not _is_storage_error(row, storage_gate):
+            continue
+        reason = _storage_error_summary(row)
+        row["storage_error"] = reason
+        if _defer_storage_recovery(
+            row,
+            storage_retry_limit,
+            allow_pre_model_initialization=_is_pre_model_initialization_storage_failure(row),
+        ):
+            row.setdefault("attempt_history", []).append({
+                "event": "recover_storage_errors",
+                "at": now(),
+                "retry_count": int(row.get("retry_count", 0)),
+                "checkpoint": row.get("checkpoint"),
+            })
+
+
+def _same_job_identity(row, prior):
+    return all(row.get(field) == prior.get(field) for field in (
+        "id", "output", "package", "condition", "turns",
+        "panel_id", "panel_manifest_sha256", "selected_stream_ids",
+        "pool_id", "pool_manifest_sha256", "package_manifest_sha256", "runtime_profiles_sha256",
+    ))
+
+
+def _restore_prior_storage_state(selected, prior_state):
+    prior_rows = {row.get("id"): row for row in prior_state.get("jobs", [])}
+    preserved_fields = {
+        "attempt_history",
+        "retry_count",
+        "storage_error",
+        "recovery_error",
+        "recovery_mode",
+        "recovery_reason",
+        "status",
+        "checkpoint",
+        "log",
+        "error",
+        "started_at",
+        "finished_at",
+        "pid",
+        "process_start_ticks",
+        "returncode",
+    }
+    for row in selected:
+        prior = prior_rows.get(row["id"])
+        if not prior or not _same_job_identity(row, prior):
+            continue
+        for field in preserved_fields:
+            if field in prior:
+                row[field] = prior[field]
+        if prior.get("status") and not prior.get("attempt_history"):
+            row["attempt_history"] = [{
+                "event": "restored_prior_status",
+                "at": now(),
+                "status": prior.get("status"),
+                "started_at": prior.get("started_at"),
+                "finished_at": prior.get("finished_at"),
+                "pid": prior.get("pid"),
+                "log": prior.get("log"),
+                "error": prior.get("error"),
+            }]
+
+
+def _clear_stale_attempt_error(row):
+    for field in ("error", "storage_error", "recovery_error", "returncode", "finished_at", "pid", "process_start_ticks"):
+        row.pop(field, None)
+
+
+def restore_adoption_boundaries(selected, handoff):
+    """An admission-width change does not authorize retrying failed jobs."""
+    previous = {row['id']: row for row in handoff['jobs']}
+    for row in selected:
+        prior = previous.get(row['id'])
+        if prior is None:
+            continue  # Legacy receipts contain only active workers.
+        if not _same_job_identity(row, prior):
+            raise ValueError('adoption job identity changed')
+        from tools.saved_judge_canary_adoption import restore_boundary
+        restore_boundary(row, prior)
+        if prior.get('status') in {'completed', 'paused_error', 'blocked_recovery',
+                                   'needs_attention', 'deferred_storage'}:
+            _restore_prior_storage_state([row], {'jobs': [prior]})
+
+
+def live_adoption_receipts(handoff):
+    # Full-state handoffs also contain never-started rows with no status. Only
+    # legacy worker-only receipts with an explicit process identity count as
+    # live when the status field is omitted; PID identity is validated next.
+    return [row for row in handoff['jobs'] if row.get('status') == 'running'
+            or (row.get('status') is None and row.get('pid')
+                and row.get('process_start_ticks'))]
+
+
+def admission_policy_state(path, *, baseline=None, active_workers=0):
+    if path is None:
+        return {'paused': False}
+    try:
+        policy = load(path)
+        if not isinstance(policy, dict) or type(policy.get('pause_admission')) is not bool:
+            raise ValueError('admission policy requires boolean pause_admission')
+        if 'time' in policy and (not isinstance(policy['time'], (int, float))
+                                  or time.time() - policy['time'] > 180):
+            raise ValueError('admission policy is stale')
+        allowed = policy.get('allowed_baselines')
+        if allowed is not None and (not isinstance(allowed, list) or any(not isinstance(x, str) or not x for x in allowed)):
+            raise ValueError('invalid admission baseline allowlist')
+        caps = policy.get('baseline_worker_caps')
+        if caps is not None and (not isinstance(caps, dict) or any(not isinstance(k, str) or type(v) is not int or not 0 <= v <= 64 for k,v in caps.items())):
+            raise ValueError('invalid per-baseline admission caps')
+        cap = caps.get(baseline, 0) if caps is not None else None
+        denied = (allowed is not None and baseline is not None and baseline not in allowed) or (baseline is not None and cap is not None and active_workers >= cap)
+        return {'paused': policy['pause_admission'] or denied, 'allowed_baselines': allowed, 'baseline': baseline, 'path': str(path),
+                'policy_time': policy.get('time')}
+    except (OSError, ValueError, TypeError) as error:
+        return {'paused': True, 'path': str(path), 'error': type(error).__name__}
+
+
+def prepare_continuation_rows(selected, source, gateway, schedule):
+    """Move dispatch ownership to a new root without moving paid worker outputs.
+
+    This is process adoption, never checkpoint recovery or retry authorization.
+    Failed/unknown execution boundaries stay excluded from new admission.
+    """
+    authorization = source.get("continuation_authorization", {})
+    if authorization.get("user_authorized") is not True:
+        raise ValueError("continuation requires explicit user authorization")
+    if process_start_ticks(source.get("pid", 0)) is not None:
+        raise ValueError("source dispatcher must exit before continuation")
+    if source.get("provider_gateway") != gateway:
+        raise ValueError("continuation gateway policy must remain unchanged")
+    validate_friday_schedule(source, schedule)
+    previous = {row["id"]: row for row in source["jobs"]}
+    if set(previous) != {row["id"] for row in selected} or len(previous) != len(source["jobs"]):
+        raise ValueError("continuation requires the exact source job scope")
+    for row in selected:
+        prior = previous[row["id"]]
+        if not _same_job_identity({**row, "output": prior["output"]}, prior):
+            raise ValueError("continuation job identity changed")
+        if any(row.get(key) != prior.get(key) for key in ("credential_slot", "credential_env", "credential_lane")):
+            raise ValueError("continuation credential slot/lane changed")
+        status = prior.get("status", "pending")
+        if status == "pending":
+            if Path(prior["output"]).exists() and any(Path(prior["output"]).rglob("*")):
+                raise ValueError("pending continuation row contains execution evidence")
+            continue  # Only never-started jobs use this new root's output/config.
+        if status not in {"running", "completed", "paused_error", "blocked_recovery", "needs_attention"}:
+            raise ValueError("unsupported continuation execution boundary")
+        row.update(prior)
+        if status == "completed":
+            if report_for(row)[1] is None:
+                raise ValueError("continuation completed report is not valid")
+        elif status == "running":
+            try:
+                AdoptedProcess(row)
+            except (OSError, ValueError):
+                report_path, report = report_for(row)
+                if report is not None:
+                    row.update(status="completed", report=str(report_path), finished_at=now())
+                else:
+                    row.update(status="blocked_recovery", recovery_reason="worker exited during handoff; no complete report, no automatic replay")
+        # Existing errors retain their original evidence and are never retried.
+    return selected
+
+
+def run_parallel(
+    repo,
+    selected,
+    all_rows,
+    config_dir,
+    state,
+    status_path,
+    concurrency,
+    job_error_policy="stop",
+    storage_gate=None,
+    storage_retry_limit=5,
+    provider_mode=None,
+    credential_pool=(),
+    credential_capacities=None,
+    resource_gate=None,
+    admission_policy_path=None,
+):
+    """One writer, isolated child per job; drain in-flight jobs on failure."""
+    if job_error_policy not in {"stop", "continue"}:
+        raise ValueError("job_error_policy must be stop or continue")
+    identities = [row["id"] for row in selected]
+    outputs = [str(Path(row["output"]).resolve()) for row in selected]
+    if len(set(identities)) != len(identities) or len(set(outputs)) != len(outputs):
+        raise ValueError("parallel jobs must have unique ids and output directories")
+    limits = friday_slot_capacities(
+        credential_pool, credential_capacities,
+    ) if provider_mode in {"friday", "openai"} else ()
+    slot_capacities = dict(enumerate(limits, 1))
+    for row in selected:
+        if row.get("credential_slot") is not None:
+            slot = int(row["credential_slot"])
+            lane = int(row.get("credential_lane", 1))
+            if slot_capacities and (slot not in slot_capacities or not 1 <= lane <= slot_capacities[slot]):
+                raise ValueError("job credential slot/lane exceeds configured capacity")
+    active = []
+    adopted_ids = set()
+    for receipt in state.pop("adopted_rows", []):
+        row = next(row for row in selected if row["id"] == receipt["id"])
+        if row["output"] != receipt["output"]:
+            raise ValueError("adopted output mismatch")
+        for field in ("credential_slot", "credential_lane"):
+            if row.get(field, 1) != receipt.get(field, 1):
+                raise ValueError("adopted credential slot/lane mismatch")
+        child = AdoptedProcess(receipt)
+        row.update(receipt)
+        row["status"] = "running"
+        active.append((row, child, open(os.devnull, "w")))
+        adopted_ids.add(row["id"])
+    if len(active) > concurrency:
+        raise ValueError("adopted workers exceed concurrency")
+    adopted_slots = Counter()
+    adopted_lanes = set()
+    for row, _, _ in active:
+        if row.get("credential_slot") is None:
+            continue
+        slot = int(row["credential_slot"])
+        lane = (slot, int(row.get("credential_lane", 1)))
+        adopted_slots[slot] += 1
+        if adopted_slots[slot] > slot_capacities.get(slot, 1) or lane in adopted_lanes:
+            raise ValueError("adopted workers exceed credential slot/lane capacity")
+        adopted_lanes.add(lane)
+    skipped = {"blocked_recovery", "deferred_storage", "needs_attention", "paused_error"}
+    pending = deque(_scheduled_pending_rows([
+        row for row in selected
+        if row["id"] not in adopted_ids and row.get("status") not in skipped
+        and not (row.get("status") == "completed" and _has_matching_report(row))
+    ]))
+    deferred = deque(_scheduled_pending_rows([
+        row for row in selected
+        if row["id"] not in adopted_ids and row.get("status") == "deferred_storage"
+    ]))
+    if resource_gate is not None:
+        pending = deque(resource_gate.order(list(pending)))
+        deferred = deque(resource_gate.order(list(deferred)))
+    exhausted = False
+    failed = any(row.get("status") in {"paused_error", "blocked_recovery", "needs_attention"} for row in selected)
+    if failed:
+        state["status"] = "running_with_errors" if job_error_policy == "continue" else "draining_error"
+
+    def publish():
+        if resource_gate is not None:
+            state["resource_health"] = resource_gate.health
+        state.update(updated_at=now(), active_jobs=[row["id"] for row, _, _ in active],
+                     current_job=active[0][0]["id"] if active else None,
+                     target_concurrency=concurrency,
+                     pending_count=len(pending),
+                     queued_count=len(pending) + len(deferred),
+                     pending_job_ids=[row["id"] for row in pending],
+                     deferred_job_ids=[row["id"] for row in deferred],
+                     deferred_jobs=[{
+                         "id": row["id"],
+                         "retry_count": int(row.get("retry_count", 0)),
+                         "checkpoint": row.get("checkpoint"),
+                         "recovery_mode": row.get("recovery_mode"),
+                     } for row in deferred],
+                     blocked_jobs=[{
+                         "id": row["id"],
+                         "status": row.get("status"),
+                         "reason": row.get("recovery_reason"),
+                     } for row in selected if row.get("status") in {"blocked_recovery", "needs_attention"}])
+        if slot_capacities:
+            state["credential_slot_usage"] = [{
+                "slot_name": credential_pool[slot - 1].slot,
+                "worker_capacity": capacity,
+                "active_workers": sum(int(row.get("credential_slot", 0)) == slot for row, _, _ in active),
+            } for slot, capacity in slot_capacities.items()]
+        save(status_path, state)
+
+    def next_pending():
+        admission = (lambda row: resource_gate.allows(row, [r for r, _, _ in active])) if resource_gate else None
+        active_slots = Counter(
+            int(row["credential_slot"])
+            for row, _, _ in active
+            if row.get("credential_slot") is not None
+        )
+        active_lanes = {
+            (int(row["credential_slot"]), int(row.get("credential_lane", 1)))
+            for row, _, _ in active if row.get("credential_slot") is not None
+        }
+        return (
+            _pop_eligible(deferred, active_slots, slot_capacities, active_lanes, admission)
+            or _pop_eligible(pending, active_slots, slot_capacities, active_lanes, admission)
+        )
+
+    # A full-width adopted cohort can run for a long time before any child
+    # exits or a new slot opens. Publish ownership immediately, so resource
+    # samplers see these paid workers instead of the pre-adoption plan.
+    state['admission_health'] = admission_policy_state(
+        admission_policy_path,
+        baseline=next((r.get('agent') for r in selected if r.get('agent')), None),
+        active_workers=len(active),
+    )
+    publish()
+    while active or not exhausted or deferred:
+        if storage_gate is not None:
+            state["storage_health"] = storage_gate.check()
+            if not state["storage_health"].get("healthy", False):
+                state["status"] = "paused_storage"
+            elif state.get("status") == "paused_storage":
+                state["status"] = "running_with_errors" if failed else "running"
+            publish()
+        # Observe exits before admitting replacements (fail-fast admission).
+        for row, child, stream in list(active):
+            code = child.poll()
+            if code is None:
+                continue
+            stream.close()
+            active.remove((row, child, stream))
+            try:
+                report_path, report = report_for(row)
+            except Exception as error:
+                report_path, report = None, None
+                row["error"] = str(error)
+            row.update(returncode=code, finished_at=now())
+            if code == 0 and row.get('saved_judge_single_canary'):
+                from tools.saved_judge_canary_adoption import finished_report
+                canary_path, canary_report = finished_report(row)
+                if canary_report is not None:
+                    row.update(status='needs_attention', saved_judge_canary_completed=True,
+                               canary_report=str(canary_path),
+                               recovery_reason='Single saved-Judge canary completed; inspect exact state and input-version review before suffix adoption.')
+                    failed = True
+                    state['status'] = 'running_with_errors'
+                    print(f"SAVED_JUDGE_CANARY_COMPLETED {row['id']} at the authorized boundary", flush=True)
+                    publish()
+                    continue
+            if code != 0 or report is None:
+                if storage_gate is not None and _is_storage_error(row, storage_gate):
+                    reason = _storage_error_summary(row)
+                    storage_gate.trip(reason)
+                    row["storage_error"] = reason
+                    if _defer_storage_recovery(
+                        row,
+                        storage_retry_limit,
+                        allow_pre_model_initialization=_is_pre_model_initialization_storage_failure(row),
+                    ):
+                        deferred.append(row)
+                        state["status"] = "paused_storage"
+                    else:
+                        failed = True
+                    print(f"STORAGE_PAUSED {row['id']}: inspect {row['log']}", flush=True)
+                else:
+                    row["status"] = "paused_error"
+                    failed = True
+                    state["status"] = "draining_error" if job_error_policy == "stop" else "running_with_errors"
+                    label = "STOPPED" if job_error_policy == "stop" else "SKIPPED_ERROR"
+                    print(f"{label} {row['id']}: inspect {row['log']}", flush=True)
+            else:
+                row.update(status="completed", report=str(report_path))
+                print(f"COMPLETED {row['id']}", flush=True)
+            publish()
+        if failed and job_error_policy == "stop":
+            exhausted = True
+            if not active:
+                # Persist queued/deferred work, but do not spin forever on it
+                # when explicit fail-fast policy forbids further admission.
+                publish()
+                break
+        while not exhausted and len(active) < concurrency:
+            if not pending and not deferred:
+                exhausted = True
+                break
+            state['admission_health'] = admission_policy_state(admission_policy_path, baseline=next((r.get('agent') for r in selected if r.get('agent')), None), active_workers=len(active))
+            if state['admission_health']['paused']:
+                # Keep polling/reaping already-paid workers while new admission
+                # is paused. This does not suspend workers or their checkpoints.
+                publish()
+                break
+            if storage_gate is not None:
+                # A just-reaped worker may have tripped the shared gate after
+                # the loop's initial sample. Never admit on that stale sample.
+                state["storage_health"] = storage_gate.check()
+                if not state["storage_health"].get("healthy", False):
+                    state["status"] = "paused_storage"
+                    publish()
+                    break
+            row = next_pending()
+            if row is None:
+                # Pending work may be pinned to an occupied affinity lane.
+                if not pending and not deferred:
+                    exhausted = True
+                publish()
+                break
+            stream = None
+            try:
+                report_path, report = report_for(row)
+                if report:
+                    row.update(status="completed", report=str(report_path))
+                    publish()
+                    continue
+                checkpoint = latest_checkpoint(row)
+                output = Path(row["output"])
+                output.mkdir(parents=True, exist_ok=True)
+                log = output / f"driver-{time.time_ns()}.log"
+                _clear_stale_attempt_error(row)
+                row.update(status="running", started_at=now(),
+                           checkpoint=str(checkpoint) if checkpoint else None, log=str(log))
+                if state.get("status") == "paused_resources":
+                    state["status"] = "running_with_errors" if failed else "running"
+                row.setdefault("attempt_history", []).append({
+                    "event": "launch",
+                    "at": row["started_at"],
+                    "retry_count": int(row.get("retry_count", 0)),
+                    "checkpoint": row["checkpoint"],
+                })
+                stream = log.open("w", encoding="utf-8")
+                child = subprocess.Popen(
+                    command(repo, row, checkpoint, config_dir),
+                    cwd=repo,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    env=(
+                        job_environment(provider_mode, credential_pool, row,
+                            profile_configuration=(load(Path(config_dir or repo) / 'provider-profile.json')
+                                if (Path(config_dir or repo) / 'provider-profile.json').is_file() else None))
+                        if provider_mode and credential_pool else None
+                    ),
+                )
+                row["pid"] = child.pid
+                start_ticks = process_start_ticks(child.pid)
+                if start_ticks is not None:
+                    row["process_start_ticks"] = start_ticks
+                active.append((row, child, stream))
+            except Exception as error:
+                if stream is not None:
+                    stream.close()
+                row.update(status="paused_error", error=str(error), finished_at=now())
+                if storage_gate is not None and _is_storage_error(row, storage_gate):
+                    storage_gate.trip(str(error))
+                    row["storage_error"] = str(error)
+                    if _defer_storage_recovery(
+                        row,
+                        storage_retry_limit,
+                        allow_pre_model_initialization=_is_pre_model_initialization_storage_failure(row),
+                    ):
+                        deferred.append(row)
+                        state["status"] = "paused_storage"
+                    else:
+                        failed = True
+                else:
+                    failed = True
+                    exhausted = job_error_policy == "stop"
+                    state["status"] = "draining_error" if job_error_policy == "stop" else "running_with_errors"
+            publish()
+        if active:
+            time.sleep(2)
+        elif (storage_gate is not None or resource_gate is not None or admission_policy_path is not None) and (pending or deferred) and not exhausted:
+            if resource_gate is not None:
+                state["status"] = "paused_resources"
+                publish()
+            time.sleep(2)
+    incomplete = [row for row in selected if not _has_matching_report(row) and row.get("status") != "completed"]
+    if failed:
+        failed_ids = [row["id"] for row in incomplete
+                      if row.get("status") in {"paused_error", "needs_attention", "blocked_recovery"}]
+        state.update(status="completed_with_errors" if job_error_policy == "continue" else "paused_error",
+                     updated_at=now(), matrix=matrix(all_rows), failed_job_ids=failed_ids,
+                     queue_drained=job_error_policy == "continue", finished_at=now())
+        save(status_path.parent / "failed-job-ids.json", failed_ids)
+        save(status_path, state)
+        return 1
+    if incomplete:
+        state.update(status="needs_attention", updated_at=now(), matrix=matrix(all_rows),
+                     incomplete_job_ids=[row["id"] for row in incomplete])
+        save(status_path, state)
+        return 1
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default="runs/mx24/full")
+    parser.add_argument("--packages", type=Path, help="legacy parent directory containing l1_arena/ and one L2 package")
+    parser.add_argument("--l1-package", type=Path, help="explicit L1 package directory")
+    parser.add_argument("--l2-package", type=Path, help="explicit L2 package directory")
+    parser.add_argument("--l2-panel", help="explicit L2 panel id from package panels.json")
+    parser.add_argument("--level", choices=("l1", "l2"), help="select one level; default runs both L1 and L2")
+    parser.add_argument("--l2-condition", action="append", choices=L2_CONDITIONS, help="L2 condition to run; repeat for reset/frozen/evolving")
+    parser.add_argument("--l1-condition", action="append", choices=L2_CONDITIONS)
+    parser.add_argument("--baseline", action="append", choices=(*BASELINES, "codex", "deepseek-harness", "zcode"))
+    parser.add_argument("--config-dir", type=Path, help="directory generated by prepare_matrix_configs.py")
+    parser.add_argument("--provider-mode", choices=sorted(PROVIDER_PROFILES), default="packycode")
+    parser.add_argument("--adopt-state", type=Path, help="explicit saved worker handoff; old dispatcher must be stopped")
+    parser.add_argument("--infrastructure-evidence-map", type=Path, help="audited full-cohort native L1 interface version replacement; retains immutable old evidence")
+    parser.add_argument("--codex-input-repair-map", type=Path, help="user-authorized, lineage-bound formal Codex local input-limit version replacements")
+    parser.add_argument("--completion-transaction-map", type=Path, help="audited replacement of infrastructure-invalid incomplete L1 transactions")
+    parser.add_argument("--verifier-grade-map", type=Path, help="audited original-answer regrading after native verifier workspace permission faults")
+    parser.add_argument("--saved-judge-canary-map", type=Path, help="one exact saved-Judge continuation, stopped at its original target Turn")
+    parser.add_argument("--admission-policy", type=Path, help="optional fresh local pause_admission policy; pauses new jobs while reaping live workers")
+    parser.add_argument("--continue-state", type=Path, help="authorized immutable dispatcher handoff into a new root; preserve paid worker outputs and credential lanes")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        help=(
+            "maximum simultaneous jobs; Friday defaults to min(total worker capacity, "
+            "stream/baseline groups); each App ID defaults to one worker"
+        ),
+    )
+    parser.add_argument("--job-error-policy", choices=("stop", "continue"), default="stop", help="parallel job failure policy; default stop preserves fail-fast admission")
+    parser.add_argument("--storage-guard", action="store_true", help="enable shared storage health gate for parallel admission")
+    parser.add_argument("--local-resource-policy", type=Path, help="opt-in CPU/memory/task-family admission policy for new local roots")
+    parser.add_argument("--storage-retry-limit", type=int, default=5, help="maximum deferred storage recovery attempts per job")
+    parser.add_argument("--recover-storage-errors", action="store_true", help="reclassify previous storage paused_error rows for guarded recovery")
+    parser.add_argument("--only", help="optional exact job id for bounded preflight")
+    parser.add_argument("--gate", action="store_true", help="run the three shortest L2 cells before releasing the full matrix")
+    parser.add_argument("--retry-interrupted-run", help="exact failed run_id or run/report path for one authorized L2 interrupted-turn retry")
+    parser.add_argument("--retry-authorization", type=Path, help="one-shot authorization ledger JSON for --retry-interrupted-run")
+    parser.add_argument("--job-ids-file", type=Path, help="public JSON list of exact job IDs for a bounded repair cohort")
+    parser.add_argument("--plan-job-ids-file", type=Path, help="new matrix scope: selected jobs define scheduling and expected coverage")
+    parser.add_argument("--friday-slot-order", help="permutation of existing slot positions, e.g. 2,3,4,5,6,1; fixed per root")
+    parser.add_argument("--friday-capacities", type=Path, help="public JSON object mapping slot names to worker limits; omitted slots default to 1, not an RPM limiter")
+    parser.add_argument("--dry-run", action="store_true", help="print a credential-free admission plan without starting workers or writing run state")
+    args = parser.parse_args()
+    if args.admission_policy and (args.only or args.gate or args.retry_interrupted_run):
+        parser.error('admission policy is for full parallel scheduling, not one-shot retries')
+    repo = Path(__file__).resolve().parents[1]
+    try:
+        credential_pool = provider_credentials(args.provider_mode, os.environ)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if args.friday_slot_order:
+        order = [int(value) for value in args.friday_slot_order.split(",")]
+        if args.provider_mode != "friday" or sorted(order) != list(range(1, len(credential_pool) + 1)):
+            raise SystemExit("Friday slot order must be a permutation of all existing slots")
+        credential_pool = tuple(credential_pool[index - 1] for index in order)
+    configured_capacities = None
+    if args.friday_capacities:
+        if args.provider_mode != "friday":
+            parser.error("--friday-capacities requires --provider-mode friday")
+        try:
+            configured_capacities = load(args.friday_capacities)
+            if not isinstance(configured_capacities, dict):
+                raise ValueError("Friday capacities must be a JSON object")
+            friday_slot_capacities(credential_pool, configured_capacities)
+        except (OSError, ValueError):
+            # JSON parser errors may contain supplied text; never echo it.
+            parser.error("invalid Friday capacity file; use slot names and positive integer worker limits")
+    root = (repo / args.root).resolve()
+    if not args.dry_run:
+        root.mkdir(parents=True, exist_ok=True)
+    execution_path = root / "matrix-execution.json"
+    status_path = root / "matrix_status.json"
+    if args.continue_state and (status_path.exists() or args.adopt_state or args.retry_interrupted_run
+                                or not args.storage_guard or args.provider_mode != "friday"):
+        parser.error("continuation requires a fresh Friday root with storage guard and no retry/adoption overrides")
+    requested_concurrency = args.concurrency
+    concurrency = requested_concurrency
+    if concurrency is None and args.provider_mode not in {"friday", "openai"}:
+        concurrency = load(execution_path).get("concurrency", 1) if execution_path.exists() else 1
+    if concurrency is not None and (
+        isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1
+    ):
+        parser.error("concurrency must be a positive integer")
+    if args.storage_retry_limit < 0:
+        parser.error("storage retry limit must be non-negative")
+    if args.storage_guard:
+        os.environ["TRIEVO_STORAGE_GUARD"] = "1"
+
+    # Retain an OS-owned lock for this process; stale files do not block resume.
+    global _driver_lock
+    if not args.dry_run:
+        _driver_lock = (root / "driver.lock").open("a+b")
+        _driver_lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(_driver_lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise SystemExit("another matrix driver already holds this output root")
+        else:
+            import fcntl
+            try:
+                fcntl.flock(_driver_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise SystemExit("another matrix driver already holds this output root")
+    all_rows = jobs(
+        repo,
+        root,
+        args.packages.resolve() if args.packages else None,
+        l1_package=args.l1_package.resolve() if args.l1_package else None,
+        l2_package=args.l2_package.resolve() if args.l2_package else None,
+        l2_conditions=tuple(args.l2_condition) if args.l2_condition else None,
+        l1_conditions=args.l1_condition,
+        baselines=args.baseline,
+        l2_panel=args.l2_panel,
+        level=args.level,
+    )
+    if any((args.infrastructure_evidence_map, args.codex_input_repair_map, args.completion_transaction_map, args.verifier_grade_map)):
+        raise SystemExit("This recovery map requires the original historical recovery environment.")
+    if args.saved_judge_canary_map:
+        from tools.saved_judge_canary_adoption import apply as apply_saved_judge_canary
+        all_rows=apply_saved_judge_canary(all_rows,root,args.saved_judge_canary_map)
+    if args.plan_job_ids_file:
+        try:
+            all_rows = restrict_plan_jobs(all_rows, load(args.plan_job_ids_file))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    config_dir = args.config_dir.resolve() if args.config_dir else repo
+    try:
+        validate_generated_profile(config_dir, args.provider_mode)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    profile_path = config_dir / "provider-profile.json"
+    profile_configuration = load(profile_path) if profile_path.exists() else {}
+    if profile_configuration.get("interleave_levels") is True:
+        os.environ["TRIEVO_INTERLEAVE_LEVELS"] = "1"
+    if profile_configuration.get("model"):
+        os.environ["TRIEVO_PROVIDER_MODEL"] = profile_configuration["model"]
+    if args.provider_mode == "packycode" and profile_configuration.get("compatibility_gateway"):
+        os.environ["TRIEVO_PACKYCODE_GATEWAY_URL"] = profile_configuration["base_url"]
+    gateway_configuration = profile_configuration.get("friday_gateway")
+    if args.provider_mode == "friday":
+        from evolink_bench.provider_profiles import get_provider_profile
+        request_model = get_provider_profile("friday", model=profile_configuration.get("model")).model
+        os.environ["TRIEVO_PROVIDER_MODEL"] = request_model
+        if gateway_configuration and gateway_configuration.get("model", "deepseek-v4-flash") != request_model:
+            raise SystemExit("Friday gateway request model differs from generated profile")
+    if gateway_configuration:
+        from evolink_bench.friday_gateway import GATEWAY_SCHEMA, validate_host_gateway_url, validate_policy
+        if (args.provider_mode != "friday" or gateway_configuration.get("schema") != GATEWAY_SCHEMA):
+            raise SystemExit("unsupported Friday shared gateway configuration")
+        validate_policy(gateway_configuration.get("policy"), {credential.slot for credential in credential_pool})
+        os.environ["TRIEVO_FRIDAY_GATEWAY_URL"] = validate_host_gateway_url(gateway_configuration["host_base_url"])
+    elif os.environ.get("TRIEVO_FRIDAY_GATEWAY_URL"):
+        raise SystemExit("Friday gateway environment requires a matching generated gateway profile")
+    selected = [row for row in all_rows if row["id"] == args.only] if args.only else all_rows
+    if args.job_ids_file:
+        job_ids = load(args.job_ids_file)
+        if (not isinstance(job_ids, list) or not job_ids or len(set(job_ids)) != len(job_ids)
+                or not set(job_ids) <= {row["id"] for row in selected}):
+            raise SystemExit("repair cohort must contain unique existing selected job IDs")
+        selected = [row for row in selected if row["id"] in job_ids]
+    if args.gate:
+        selected = selected[:3]
+    if not selected:
+        raise SystemExit("no matching job")
+    credential_schedule = None
+    if args.provider_mode in {"friday", "openai"}:
+        capacities = friday_slot_capacities(credential_pool, configured_capacities)
+        credential_schedule = assign_friday_credentials(selected, credential_pool, capacities)
+        previous_state = load(status_path) if status_path.exists() else {}
+        if previous_state and previous_state.get("provider_gateway") != gateway_configuration:
+            raise SystemExit("Friday provider gateway differs from this output root; use a new --root")
+        try:
+            validate_friday_schedule(previous_state, credential_schedule)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        group_count = len(credential_schedule["affinity_assignments"])
+        concurrency = friday_concurrency(requested_concurrency, sum(capacities), group_count)
+    if args.retry_interrupted_run:
+        concurrency = 1  # One authorization always binds exactly one attempt.
+    if args.retry_interrupted_run and len(selected) != 1:
+        raise SystemExit("--retry-interrupted-run requires one selected job")
+    if args.recover_storage_errors and not args.storage_guard:
+        parser.error("--recover-storage-errors requires --storage-guard")
+    selected_panel_ids = sorted({row.get("panel_id") for row in selected if row.get("level") == "l2" and row.get("panel_id")})
+    if len(selected_panel_ids) > 1 and args.l2_panel != "all":
+        raise SystemExit(f"selected L2 jobs span multiple panels: {selected_panel_ids}")
+    if args.dry_run:
+        print(json.dumps({
+            "dry_run": True,
+            "selected_jobs": len(selected),
+            "concurrency": concurrency,
+            "requested_concurrency": requested_concurrency,
+            "job_error_policy": args.job_error_policy,
+            "credential_schedule": credential_schedule,
+            "provider_gateway": gateway_configuration,
+            "local_resource_policy": load(args.local_resource_policy) if args.local_resource_policy else None,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    if gateway_configuration:
+        from evolink_bench.friday_gateway import check_gateway
+        try:
+            check_gateway(gateway_configuration["host_base_url"], credential_pool, gateway_configuration["policy"], gateway_configuration.get("model"))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    storage_gate = storage_gate_from_environment() if args.storage_guard else None
+    resource_gate = None
+    resource_policy = load(args.local_resource_policy) if args.local_resource_policy else None
+    previous_resource_policy = load(status_path).get("local_resource_policy") if status_path.exists() else None
+    if status_path.exists() and previous_resource_policy != resource_policy:
+        raise SystemExit("local resource policy differs from this output root; use a new --root")
+    if resource_policy:
+        from evolink_bench.local_resources import LocalResourceGate
+        resource_gate = LocalResourceGate(resource_policy)
+    continuation_source = load(args.continue_state) if args.continue_state else None
+    if continuation_source is not None:
+        if concurrency < 2:
+            parser.error("continuation requires parallel dispatch")
+        prepare_continuation_rows(selected, continuation_source, gateway_configuration, credential_schedule)
+    if args.storage_guard and storage_gate is None:
+        raise SystemExit("--storage-guard requested but StorageGate.from_environment() returned no gate")
+    prior_state = load(status_path) if status_path.exists() and args.storage_guard else {}
+    if prior_state:
+        _restore_prior_storage_state(selected, prior_state)
+    if args.recover_storage_errors:
+        _prepare_recovered_storage_rows(selected, storage_gate, args.storage_retry_limit)
+    state = {
+        "status": "running",
+        "pid": os.getpid(),
+        "started_at": now(),
+        "jobs": selected,
+        "concurrency": concurrency,
+        "requested_concurrency": requested_concurrency,
+        "provider_mode": args.provider_mode,
+        "job_error_policy": args.job_error_policy,
+        "phase": "gate" if args.gate else ("only" if args.only else "full"),
+    }
+    if resource_policy:
+        state["local_resource_policy"] = resource_policy
+    if continuation_source is not None:
+        state["continuation"] = {
+            "source_state": str(args.continue_state.resolve()),
+            "source_sha256": _sha256_file(args.continue_state),
+            "source_driver_pid": continuation_source["pid"],
+            "source_resource_policy": continuation_source.get("local_resource_policy"),
+            "paid_outputs_and_lanes_preserved": True,
+            "automatic_replay_authorized": False,
+        }
+    if credential_schedule is not None:
+        state["credential_schedule"] = credential_schedule
+    if gateway_configuration:
+        state["provider_gateway"] = gateway_configuration
+    if len(selected_panel_ids) > 1:
+        state["l2_panels"] = [{
+            "panel_id": panel,
+            "panel_manifest_sha256": next(row["panel_manifest_sha256"] for row in selected if row.get("panel_id") == panel),
+            "selected_stream_ids": next(row["selected_stream_ids"] for row in selected if row.get("panel_id") == panel),
+            "allows_cross_panel_aggregation": False,
+        } for panel in selected_panel_ids]
+    elif selected_panel_ids:
+        panel_rows = [row for row in selected if row.get("level") == "l2" and row.get("panel_id")]
+        state["l2_panel"] = {
+            "panel_id": selected_panel_ids[0],
+            "panel_manifest_sha256": panel_rows[0].get("panel_manifest_sha256"),
+            "selected_stream_ids": panel_rows[0].get("selected_stream_ids", []),
+            "allows_cross_panel_aggregation": False,
+        }
+    if args.storage_guard and not args.adopt_state:
+        survivors = [row for row in selected
+                     if row.get("status") == "running" and row.get("process_start_ticks")
+                     and process_start_ticks(row.get("pid")) == str(row["process_start_ticks"])]
+        if survivors:
+            if concurrency < 2 or args.retry_interrupted_run or args.gate or args.only:
+                parser.error("live workers require a full parallel resume")
+            # The output lock is held; adopt verified survivors instead of
+            # issuing duplicate work after a dispatcher-only restart.
+            for row in survivors:
+                AdoptedProcess(row)
+            state["adopted_rows"] = survivors
+    if args.adopt_state:
+        if concurrency < 2 or args.retry_interrupted_run or args.gate or args.only:
+            parser.error("adoption requires a parallel full invocation")
+        handoff = load(args.adopt_state)
+        restore_adoption_boundaries(selected, handoff)
+        state["adopted_rows"] = live_adoption_receipts(handoff)
+        for row in state["adopted_rows"]:
+            if row["id"] not in {job["id"] for job in selected}:
+                parser.error("adopted job is not selected")
+            AdoptedProcess(row)
+    save(status_path, state)
+    if resource_gate is not None or concurrency > 1 or (args.job_error_policy == "continue"
+                           and not (args.retry_interrupted_run or args.gate or args.only)):
+        code = run_parallel(
+            repo,
+            selected,
+            all_rows,
+            config_dir,
+            state,
+            status_path,
+            concurrency,
+            args.job_error_policy,
+            storage_gate=storage_gate,
+            storage_retry_limit=args.storage_retry_limit,
+            provider_mode=args.provider_mode,
+            credential_pool=credential_pool,
+            credential_capacities=configured_capacities,
+            resource_gate=resource_gate,
+            admission_policy_path=args.admission_policy,
+        )
+        if code:
+            return code
+    else:
+        for row in selected:
+            retry_run_id = None
+            stop_after_turn = None
+            if args.retry_interrupted_run:
+                checkpoint, retry_run_id, stop_after_turn = prepare_interrupted_retry(
+                    row,
+                    args.retry_interrupted_run,
+                    args.retry_authorization,
+                )
+            else:
+                report_path, report = report_for(row)
+                if report:
+                    row.update(status="completed", report=str(report_path))
+                    continue
+                checkpoint = latest_checkpoint(row)
+            output = Path(row["output"])
+            output.mkdir(parents=True, exist_ok=True)
+            log = output / f"driver-{int(time.time())}.log"
+            row.update(status="running", started_at=now(), checkpoint=str(checkpoint) if checkpoint else None, log=str(log))
+            with log.open("w", encoding="utf-8") as stream:
+                child = subprocess.Popen(
+                    command(
+                        repo,
+                        row,
+                        checkpoint,
+                        config_dir,
+                        retry_interrupted_run=retry_run_id,
+                        retry_authorization=args.retry_authorization,
+                        stop_after_turn=stop_after_turn,
+                    ),
+                    cwd=repo,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    env=job_environment(args.provider_mode, credential_pool, row,
+                                        profile_configuration=profile_configuration),
+                )
+                row["pid"] = child.pid
+                state.update(current_job=row["id"], updated_at=now())
+                save(status_path, state)
+                while child.poll() is None:
+                    time.sleep(2)
+                code = child.returncode
+            if stop_after_turn:
+                report_path, report = report_for_interrupted_retry(row, stop_after_turn)
+            else:
+                report_path, report = report_for(row)
+            if code != 0 or report is None:
+                row.update(status="paused_error", returncode=code, finished_at=now())
+                state.update(status="paused_error", updated_at=now(), matrix=matrix(all_rows))
+                save(status_path, state)
+                print(f"STOPPED {row['id']}: inspect {log}", flush=True)
+                return 1
+            if stop_after_turn:
+                row.update(status="interrupted_retry_completed", report=str(report_path), finished_at=now())
+                state.update(status="interrupted_retry_completed", updated_at=now(), matrix=matrix(all_rows))
+                save(status_path, state)
+                print(f"RETRY_COMPLETED {row['id']} through {stop_after_turn}", flush=True)
+                return 0
+            row.update(status="completed", report=str(report_path), finished_at=now())
+            state.update(updated_at=now(), matrix=matrix(all_rows))
+            save(status_path, state)
+            print(f"COMPLETED {row['id']}", flush=True)
+    aggregations = matched_l2_aggregations(all_rows)
+    state.update(
+        status="gate_completed" if (args.gate or args.only) else "completed",
+        finished_at=now(),
+        matrix=matrix(all_rows),
+        l2_evolution_aggregations=aggregations,
+    )
+    save(status_path, state)
+    save(root / "result_matrix.json", state["matrix"])
+    if aggregations:
+        save(root / "l2_evolution_aggregations.json", aggregations)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,29 @@
+ARG BASE_IMAGE=python:3.11-slim
+FROM ${BASE_IMAGE}
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG APT_ORIGIN=http://deb.debian.org
+
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
+RUN sed -i "s|http://deb.debian.org|${APT_ORIGIN}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/evolink
+COPY pyproject.toml README.md LICENSE /opt/evolink/
+COPY licenses/ /opt/evolink/licenses/
+COPY evolink_bench/ /opt/evolink/evolink_bench/
+COPY baseline/adaptive-auto-harness/ /opt/evolink/baseline/adaptive-auto-harness/
+COPY baseline/adapters/adaptive_auto_harness/ /opt/evolink/baseline/adapters/adaptive_auto_harness/
+
+RUN pip install --no-cache-dir \
+        '/opt/evolink/baseline/adaptive-auto-harness[openai]' \
+        'matplotlib>=3.8,<4' 'numpy>=2,<3' 'pandas>=2.2,<4' \
+        'scikit-learn>=1.5,<2' 'scipy>=1.13,<2' 'seaborn>=0.13,<1' \
+    && pip install --no-cache-dir --no-deps /opt/evolink
+
+ENV PYTHONPATH=/opt/evolink/baseline/adaptive-auto-harness:/opt/evolink
+ENTRYPOINT ["python", "/opt/evolink/baseline/adapters/adaptive_auto_harness/bridge.py"]

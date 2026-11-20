@@ -1,0 +1,31 @@
+name: Offline checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project and offline test dependencies
+        run: python -m pip install -e ".[gateway]" pytest jsonschema build
+      - name: Compile
+        run: python -m compileall -q evolink_bench baseline/adapters tools tests
+      - name: Offline tests
+        run: python -m pytest tests -q
+      - name: Scripted smoke
+        run: evolink-bench --spec examples/smoke.json --output runs/ci-smoke
+      - name: Build distributions
+        run: python -m build

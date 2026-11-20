@@ -1,0 +1,65 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local package metadata
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account.json
+
+# Experiment outputs and unpacked demo packages
+runs/
+output/
+outputs/
+datasets/
+private-research/
+benchmarks/current/
+benchmarks/archive/
+tmp/
+release/
+*.log
+
+# Local clones of external benchmark/framework repositories
+frameworks/
+baseline/hermes-agent/
+baseline/prime-agent/
+baseline/adaptive-auto-harness/
+baseline/opencode/
+baseline/codex/
+baseline/deepseek-harness/
+baseline/ZCode/
+baseline/SkillOpt/
+baseline/Trace2Skill/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local Docker/runtime state
+.tmp/
+.docker/
+.l2_state/
+
+# Machine-local matrix configuration (regenerate with tools/prepare_matrix_configs.py)
+tmp_*.override.json
+start_probe_runs.ps1

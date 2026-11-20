@@ -1,0 +1,29 @@
+ARG BASE_IMAGE=python:3.11-slim
+FROM ${BASE_IMAGE}
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG APT_ORIGIN=http://deb.debian.org
+
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
+RUN sed -i "s|http://deb.debian.org|${APT_ORIGIN}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/evolink
+COPY pyproject.toml README.md LICENSE /opt/evolink/
+COPY licenses/ /opt/evolink/licenses/
+COPY evolink_bench/ /opt/evolink/evolink_bench/
+COPY baseline/SkillOpt/ /opt/evolink/baseline/SkillOpt/
+COPY baseline/adapters/skillopt/ /opt/evolink/baseline/adapters/skillopt/
+
+RUN pip install --no-cache-dir -r /opt/evolink/baseline/SkillOpt/requirements.txt \
+    && pip install --no-cache-dir \
+        'matplotlib>=3.8,<4' 'pandas>=2.2,<4' 'scikit-learn>=1.5,<2' \
+        'scipy>=1.13,<2' 'seaborn>=0.13,<1' \
+    && pip install --no-cache-dir --no-deps .
+
+ENV PYTHONPATH=/opt/evolink/baseline/SkillOpt:/opt/evolink
+ENTRYPOINT ["python", "/opt/evolink/baseline/adapters/skillopt/bridge.py"]

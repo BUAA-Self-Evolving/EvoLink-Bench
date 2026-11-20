@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "Please cite EvoLink-Bench when using this software."
+title: "EvoLink-Bench: A Benchmark for Evaluating Self-Evolving Agents in Long-Horizon Interdependent Task Streams"
+type: software
+version: "0.1.0"
+repository-code: "https://github.com/BUAA-Self-Evolving/EvoLink-Bench"
+authors:
+  - family-names: Chen
+    given-names: Wei
+  - family-names: Lu
+    given-names: Xiaodong
+  - family-names: Shen
+    given-names: Weihao
+  - family-names: Li
+    given-names: Gongxun
+  - family-names: Guo
+    given-names: Xingyu
+  - family-names: Sun
+    given-names: Qihang
+  - family-names: Zhang
+    given-names: Fuwei
+  - family-names: Zhang
+    given-names: Zhao
+  - family-names: Ban
+    given-names: Yikun
+  - family-names: Li
+    given-names: Shuang
+  - family-names: Wang
+    given-names: Deqing
+  - family-names: Zhuang
+    given-names: Fuzhen

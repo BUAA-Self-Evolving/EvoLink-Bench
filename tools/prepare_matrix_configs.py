@@ -1,0 +1,270 @@
+"""Generate machine-local, credential-free Docker configs for the current matrix."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from evolink_bench.provider_profiles import PROVIDER_PROFILES, get_provider_profile
+
+PROXY_ENV_NAMES = (
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+
+
+def _add_passthrough_env(command, names):
+    image = command.pop()
+    existing = {
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-e"
+    }
+    for name in names:
+        if name not in existing:
+            command.extend(["-e", name])
+    command.append(image)
+    return command
+
+
+V5_TAU2_LIVE_LIMITS = {"max_tool_calls": 60, "max_model_calls": 80, "episode_timeout_seconds": 1800}
+
+
+def _v5_tau2_stream_ids(repo: Path) -> list[str]:
+    plan = json.loads((repo / "benchmarks/current/L2_Demo_V5/stream_plan.json").read_text(encoding="utf-8"))
+    return [
+        stream["stream_id"]
+        for stream in plan["streams"]
+        if any(cap["capability_id"].startswith("tau2.") for cap in stream["capabilities"])
+    ]
+
+
+def generate(
+    output: Path,
+    model: str | None = None,
+    base_url: str | None = None,
+    *,
+    provider_mode: str = "packycode",
+    l2_max_output_tokens: int = 12000,
+    api_timeout_seconds: int | None = None,
+    api_max_retries: int | None = None,
+    hermes_image: str = "evolink-hermes:matrix-current",
+    skillopt_image: str = "evolink-skillopt:matrix-current",
+    trace2skill_image: str = "evolink-trace2skill:matrix-current",
+    inherit_proxy: bool | None = None,
+):
+    profile = get_provider_profile(provider_mode)
+    model = model or profile.model
+    base_url = base_url or profile.base_url
+    api_timeout_seconds = api_timeout_seconds if api_timeout_seconds is not None else profile.timeout_seconds
+    api_max_retries = api_max_retries if api_max_retries is not None else profile.max_retries
+    inherit_proxy = profile.inherit_proxy if inherit_proxy is None else inherit_proxy
+    thinking = profile.thinking
+    if not 1 <= l2_max_output_tokens <= 1_000_000:
+        raise ValueError("l2_max_output_tokens must be between 1 and 1000000")
+    if not 1 <= api_timeout_seconds <= 3600:
+        raise ValueError("api_timeout_seconds must be between 1 and 3600")
+    if not 0 <= api_max_retries <= 20:
+        raise ValueError("api_max_retries must be between 0 and 20")
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    repo = REPO_ROOT
+    limits = {
+        "max_model_calls": 24,
+        "max_tool_calls": 20,
+        "episode_timeout_seconds": 900,
+        "max_output_tokens": l2_max_output_tokens,
+    }
+    # The repaired SkillsBench package declares a 40-call ceiling. Other
+    # streams keep their package-local 20-call ceiling through
+    # _effective_work_limits(), so this does not silently widen them.
+    l2_limits = {**limits, "max_tool_calls": 40}
+    # Live τ² Turns in L2 Demo V5 talk to the user simulator and need 60 tool
+    # calls, 80 model calls and 1800 s. Raise the ceiling only for the V5
+    # Streams that contain τ² Turns; their runtime profiles still hold every
+    # other Turn in those Streams to 20 tool calls and 24 model calls.
+    l2_stream_overrides = [
+        {"stream_id": stream_id, "limits": dict(V5_TAU2_LIVE_LIMITS)}
+        for stream_id in _v5_tau2_stream_ids(repo)
+    ]
+
+    def save(name, value):
+        (output / name).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+    hermes = json.loads((repo / "evolink_bench/baselines/manifests/hermes.json").read_text(encoding="utf-8"))
+    original = hermes["adapter"]["command"]
+    command = []
+    index = 0
+    while index < len(original):
+        # Do not assume this workstation's proxy exists on collaborators' hosts.
+        if original[index] == "-e" and any(
+            original[index + 1] == name or original[index + 1].startswith(name + "=")
+            for name in PROXY_ENV_NAMES
+        ):
+            index += 2
+        else:
+            command.append(original[index])
+            index += 1
+    command = _add_passthrough_env(command, PROXY_ENV_NAMES if inherit_proxy else ())
+    for level, cap in (("l1", 1200), ("l2", l2_max_output_tokens)):
+        seed = output / f"hermes-{level}-seed"
+        seed.mkdir(exist_ok=True)
+        # JSON scalars are valid YAML; no credentials are written to disk.
+        # A relay can expose arbitrary model IDs.  Hermes' first-party DeepSeek
+        # provider normalizes unknown IDs, so route relay traffic as custom.
+        (seed / "config.yaml").write_text(
+            f"model:\n  default: {json.dumps(model)}\n  provider: custom\n"
+            f"  base_url: {json.dumps(base_url)}\n  max_tokens: {cap}\n"
+            "auxiliary:\n  title_generation:\n    enabled: false\n"
+            f"agent:\n  reasoning_effort: {'high' if thinking == 'enabled' else 'none'}\n  api_max_retries: {api_max_retries}\n"
+            f"providers:\n  custom:\n    base_url: {json.dumps(base_url)}\n"
+            "    key_env: OPENAI_API_KEY\n    api_mode: chat_completions\n"
+            f"    extra_body:\n      thinking:\n        type: {thinking}\n"
+            f"      reasoning:\n        enabled: {'true' if thinking == 'enabled' else 'false'}\n"
+            f"    request_timeout_seconds: {api_timeout_seconds}\n",
+            encoding="utf-8",
+        )
+        save(f"tmp_hermes_cf_{level}.override.json", {
+            "adapter": {"command": command},
+            "state": {"seed_from": str(seed), "seed_files": ["config.yaml"]},
+            "options": {"image": hermes_image, "approval_policy": "session",
+                        "thinking": thinking,
+                        "l2_agent_limits": l2_limits if level == "l2" else limits,
+                        **({"l2_stream_limit_overrides": l2_stream_overrides} if level == "l2" else {})},
+        })
+
+    for agent, image, env_names, options in (
+        ("skillopt", skillopt_image,
+         ["OPENAI_COMPATIBLE_BASE_URL", "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_MODEL",
+          "TARGET_OPENAI_COMPATIBLE_BASE_URL", "TARGET_OPENAI_COMPATIBLE_API_KEY", "TARGET_OPENAI_COMPATIBLE_MODEL"],
+         {"target_model": model, "optimizer_model": model, "target_backend": "openai_compatible",
+          "optimizer_backend": "openai_compatible", "openai_compatible_base_url": base_url,
+          "openai_compatible_model": model, "max_completion_tokens": 4096,
+          "native_tool_rounds": 16, "exec_timeout": 90, "retries": 1}),
+        ("trace2skill", trace2skill_image, ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
+         {"model": model, "max_turns": 24, "request_timeout": 120, "tool_timeout": 90,
+          "generation_config": {"thinking": {"type": thinking}}}),
+        ("prime-agent", "evolink-prime-agent:matrix-current", ["OPENAI_API_KEY"],
+         {"provider": "trievo", "model": model, "base_url": base_url,
+           "api": "openai-completions", "api_key_env": "TRIEVO_API_KEY",
+           "thinking": "on" if thinking == "enabled" else "off",
+           "reasoning": thinking == "enabled", "max_output_tokens": 4096,
+           "request_timeout_seconds": api_timeout_seconds,
+           "max_retries": min(5, api_max_retries)}),
+        ("adaptive-auto-harness", "evolink-adaptive-auto-harness:matrix-current",
+         ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
+         {"model": model, "base_url": base_url, "api_key_env": "TRIEVO_API_KEY",
+          "thinking": thinking,
+          "max_output_tokens": 4096, "max_steps": 20, "tool_timeout": 90,
+          "evolver_model": model, "evolver_base_url": base_url,
+          "evolver_api_key_env": "TRIEVO_API_KEY", "evolver_max_tokens": 4096,
+          "evolve_prompts": True, "evolve_skills": True,
+          "evolve_memory": True, "evolve_tools": False}),
+        ("opencode", "evolink-opencode:matrix-current", ["OPENAI_API_KEY"],
+         {"model": model, "base_url": base_url, "api_key_env": "TRIEVO_API_KEY",
+          "agent": "build", "max_output_tokens": 4096,
+          "reasoning": thinking == "enabled",
+          "request_timeout_seconds": 900}),
+    ):
+        container = f"evolink-{agent}-{{instance_id}}"
+        command = ["docker", "run", "--rm", "-i", "--name", container,
+                   "--user", "{uid}:{gid}",
+                   "-v", "{workspace_mount}:/workspace", "-v", "{state_mount}:/state"]
+        for name in env_names + [
+            "TRIEVO_BASE_URL",
+            "TRIEVO_API_KEY",
+            "TRIEVO_MODEL",
+            "TRIEVO_THINKING",
+            "TRIEVO_API_TIMEOUT_SECONDS",
+            "TRIEVO_API_MAX_RETRIES",
+            *(PROXY_ENV_NAMES if inherit_proxy else ()),
+        ]:
+            command.extend(["-e", name])
+        command.append(image)
+        config = {
+            "adapter": {"command": command, "cwd": "{repo_root}",
+                        "cleanup_command": ["docker", "rm", "-f", container]},
+            "workspace": {"mode": "shared_volume", "adapter_path": "/workspace"},
+            "state": {"adapter_path": "/state"},
+            "environment": {"set": {"TRIEVO_THINKING": thinking}},
+            "options": {**options, "l2_agent_limits": limits},
+        }
+        save(f"tmp_{agent}_docker.override.json", config)
+        if agent == "skillopt":
+            save("tmp_skillopt_docker_l2.override.json", {
+                **config,
+                "options": {
+                    **config["options"],
+                    "l2_agent_limits": l2_limits,
+                    "l2_stream_limit_overrides": l2_stream_overrides,
+                    "max_completion_tokens": l2_max_output_tokens,
+                    "openai_compatible_max_tokens": l2_max_output_tokens,
+                },
+            })
+        elif agent == "trace2skill":
+            save("tmp_trace2skill_docker_l2.override.json", {
+                **config,
+                "options": {
+                    **config["options"],
+                    "l2_agent_limits": l2_limits,
+                    "l2_stream_limit_overrides": l2_stream_overrides,
+                    "request_timeout": api_timeout_seconds,
+                    "max_tokens": l2_max_output_tokens,
+                    "evolution_max_tokens": l2_max_output_tokens,
+                    "generation_config": {
+                        **config["options"]["generation_config"],
+                        "max_tokens": l2_max_output_tokens,
+                    },
+                },
+            })
+    save("provider-profile.json", profile.public_metadata() | {
+        "base_url": base_url,
+        "model": model,
+        "thinking": thinking,
+        "timeout_seconds": api_timeout_seconds,
+        "max_retries": api_max_retries,
+        "inherit_proxy": inherit_proxy,
+    })
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("tmp/matrix-config"))
+    parser.add_argument("--provider-mode", choices=sorted(PROVIDER_PROFILES), default="packycode")
+    parser.add_argument("--model", help="override the selected provider profile model")
+    parser.add_argument("--base-url", help="override the selected provider profile base URL")
+    parser.add_argument("--l2-max-output-tokens", type=int, default=12000)
+    parser.add_argument("--api-timeout-seconds", type=int)
+    parser.add_argument("--api-max-retries", type=int)
+    parser.add_argument("--hermes-image", default="evolink-hermes:matrix-current")
+    parser.add_argument("--skillopt-image", default="evolink-skillopt:matrix-current")
+    parser.add_argument("--trace2skill-image", default="evolink-trace2skill:matrix-current")
+    parser.add_argument(
+        "--direct-api",
+        action="store_true",
+        help="do not inherit host proxy variables into baseline containers",
+    )
+    args = parser.parse_args()
+    print(generate(
+        args.output,
+        args.model,
+        args.base_url,
+        l2_max_output_tokens=args.l2_max_output_tokens,
+        api_timeout_seconds=args.api_timeout_seconds,
+        api_max_retries=args.api_max_retries,
+        hermes_image=args.hermes_image,
+        skillopt_image=args.skillopt_image,
+        trace2skill_image=args.trace2skill_image,
+        provider_mode=args.provider_mode,
+        inherit_proxy=False if args.direct_api else None,
+    ))
+
+
+if __name__ == "__main__":
+    main()

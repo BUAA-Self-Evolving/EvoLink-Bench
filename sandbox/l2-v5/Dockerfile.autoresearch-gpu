@@ -1,0 +1,28 @@
+# AutoResearch GPU task image for the rebuilt L2 V5 pool (requires_gpu tasks).
+#
+# Built on the CPU image so both share one resolved package set; only the
+# accelerator builds change: torch/torchvision from the CUDA 12.4 wheel index,
+# jax with the CUDA 12 plugins (MLGym rl*/requirements.txt uses jax[cuda12]),
+# and xgboost with GPU support instead of xgboost-cpu. Verifiers never need a
+# GPU; this image only matters on a runtime with GPU passthrough. JAX_PLATFORMS
+# is reset to empty (auto) because the CPU base pins it to cpu.
+ARG BASE_IMAGE=evolink-l2-v5-ar-cpu:0.1
+FROM ${BASE_IMAGE}
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+
+RUN pip install --no-cache-dir --index-url "${TORCH_INDEX_URL}" --extra-index-url "${PIP_INDEX_URL}" \
+        --force-reinstall --no-deps 'torch==2.6.0' 'torchvision==0.21.0' \
+    && pip install --no-cache-dir --index-url "${TORCH_INDEX_URL}" --extra-index-url "${PIP_INDEX_URL}" 'torch==2.6.0'
+
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" 'jax[cuda12]==0.5.3' \
+    && pip uninstall -y xgboost-cpu \
+    && pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" 'xgboost>=2.1,<4'
+
+RUN python -c "import torch, torchvision, jax, xgboost, gymnax, datasets; assert torch.version.cuda, torch.__version__; print(torch.__version__, torch.version.cuda, jax.__version__, xgboost.__version__)"
+
+ENV HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false JAX_PLATFORMS=
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

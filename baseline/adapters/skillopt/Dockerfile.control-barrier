@@ -1,0 +1,2 @@
+FROM evolink-skillopt:0.10
+COPY baseline/adapters/skillopt/bridge.py /opt/evolink/baseline/adapters/skillopt/bridge.py

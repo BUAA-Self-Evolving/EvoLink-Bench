@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evolink-bench"
+version = "0.1.0"
+description = "EvoLink-Bench: evaluating self-evolving agents in long-horizon interdependent task streams"
+readme = "README.md"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "licenses/*"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+gateway = ["httpx[http2]>=0.28,<0.29"]
+
+[dependency-groups]
+dev = ["jsonschema>=4.23,<5", "pytest>=8.3,<9"]
+
+[project.scripts]
+evolink-bench = "evolink_bench.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["evolink_bench*"]
+
+[tool.setuptools.package-data]
+"evolink_bench.baselines" = ["manifests/*.json"]
+"evolink_bench.tau2_live.session.areal" = ["benchmark_fixes.json", "PROVENANCE.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.evolink-bench]
+display-name = "EvoLink-Bench"

@@ -1,0 +1,834 @@
+from __future__ import annotations
+
+import contextlib
+import json
+import subprocess
+import sys
+import tempfile
+import threading
+import types
+import unittest
+import zipfile
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from evolink_bench.baselines.hermes_bridge import (
+    HermesBridge,
+    _extract_l1_protocol,
+    _is_l1_metadata,
+    _complete_l1_file_actions,
+    _l1_persistent_state_context,
+    _l1_readonly_workspace_context,
+    _merge_l1_state,
+)
+from evolink_bench.baselines.manifest import load_manifest
+from evolink_bench.baselines.process import ProcessBaselineRuntime
+from evolink_bench.model import TokenBudget
+from evolink_bench.baselines.registry import resolve_baseline_selection
+from evolink_bench.runner import Runner
+from evolink_bench.sandbox import LocalSandbox
+from evolink_bench.spec import BenchmarkSpec
+from evolink_bench.verifier import LLMJudge
+
+
+class BaselineRuntimeTest(unittest.TestCase):
+    def test_failed_evolution_evidence_survives_stable_state_rollback(self) -> None:
+        from evolink_bench.baselines.base import EvolutionContext
+        for recoverable in (False, True):
+            with self.subTest(recoverable=recoverable), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runtime = ProcessBaselineRuntime(load_manifest(self._manifest(root)),
+                                                 budget=TokenBudget(limit=100), repo_root=root)
+                runtime._state_dir = root / "state"
+                learning = runtime._state_dir / "learning"
+                learning.mkdir(parents=True)
+                (learning / "stable.txt").write_text("original")
+                runtime._flow = SimpleNamespace(output_dir=root / "output")
+                runtime._current_turn = "turn2"
+                runtime._stable_state = runtime._capture_state(include_bytes=True)
+                def request(*args, **kwargs):
+                    (learning / "stable.txt").write_text("partial change")
+                    (learning / "completion.json").write_text('{"text":"bad","usage":17}')
+                    if not recoverable:
+                        raise RuntimeError("proposal rejected")
+                    return {"completed": False, "recoverable_failure": True,
+                            "usage": {"api_calls": 1, "total_tokens": 17}}
+                with patch.object(runtime, "_request", side_effect=request) as calls:
+                    context = EvolutionContext(turn_id="turn2", trajectory=[], feedback=[])
+                    if recoverable:
+                        result = runtime.evolve(context)
+                        self.assertFalse(result.completed)
+                        self.assertEqual(result.usage.api_calls, 1)
+                        self.assertEqual(result.changed_files, [])
+                        self.assertTrue(runtime._turn_evolved)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "proposal rejected"):
+                            runtime.evolve(context)
+                        self.assertFalse(runtime._turn_evolved)
+                    calls.assert_called_once()
+                if recoverable:
+                    runtime.end_flow()
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "state changed asynchronously"):
+                        runtime.end_flow()
+                artifacts = list((root / "output/failed_evolution").glob("*/baseline_state.zip"))
+                self.assertEqual(len(artifacts), 1)
+                with zipfile.ZipFile(artifacts[0]) as bundle:
+                    self.assertEqual(bundle.read("learning/completion.json"), b'{"text":"bad","usage":17}')
+                    self.assertEqual(bundle.read("learning/stable.txt"), b"partial change")
+                with zipfile.ZipFile(root / "output/baseline_state.zip") as bundle:
+                    self.assertEqual(bundle.read("learning/stable.txt"), b"original")
+                    self.assertNotIn("learning/completion.json", bundle.namelist())
+
+    def test_hermes_foreground_removes_learning_tools_from_worker_dispatch(self) -> None:
+        whitelist_calls = []
+        plugins = types.ModuleType("hermes_cli.plugins")
+        plugins.set_thread_tool_whitelist = (
+            lambda allowed, **_kwargs: whitelist_calls.append(set(allowed))
+        )
+        plugins.clear_thread_tool_whitelist = lambda: whitelist_calls.append(None)
+        hermes_cli = types.ModuleType("hermes_cli")
+        hermes_cli.plugins = plugins
+
+        terminal = types.ModuleType("tools.terminal_tool")
+        terminal._get_approval_callback = lambda: None
+        terminal.set_approval_callback = lambda _callback: None
+        terminal.terminal_tool = lambda *_args, **_kwargs: "ok"
+        memory = types.ModuleType("tools.memory_tool")
+        memory.memory_tool = lambda *_args, **_kwargs: "ok"
+        tools_module = types.ModuleType("tools")
+        tools_module.terminal_tool = terminal
+        tools_module.memory_tool = memory
+
+        agent = SimpleNamespace(
+            valid_tool_names={"terminal", "memory", "skill_manage", "session_search"}
+        )
+        bridge = HermesBridge()
+        bridge._policy = "turn_boundary"
+        modules = {
+            "hermes_cli": hermes_cli,
+            "hermes_cli.plugins": plugins,
+            "tools": tools_module,
+            "tools.terminal_tool": terminal,
+            "tools.memory_tool": memory,
+        }
+        with patch.dict(sys.modules, modules):
+            with bridge._foreground_policy(agent, "session-1", "/workspace", {}):
+                self.assertEqual(agent.valid_tool_names, {"terminal"})
+                self.assertEqual(whitelist_calls[-1], {"terminal"})
+
+        self.assertEqual(
+            agent.valid_tool_names,
+            {"terminal", "memory", "skill_manage", "session_search"},
+        )
+        self.assertIsNone(whitelist_calls[-1])
+
+    def test_checkpoint_resume_retains_prefix_and_learning_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec()
+            flow = spec.flows[0]
+            flow.turns.append(replace(flow.turns[0], id="process-turn-2"))
+            manifest = self._manifest(root)
+            original = Runner(spec, output_dir=root / "first", baseline="fake", baseline_manifest=str(manifest)).run(flow)
+            checkpoint = next((root / "first" / "_checkpoints").glob("*/t0001"))
+            resumed = Runner(spec, output_dir=root / "resumed", baseline="fake", baseline_manifest=str(manifest), resume_checkpoint=checkpoint).run(flow)
+            self.assertEqual([row["turn_id"] for row in resumed["turns"]], ["process-turn", "process-turn-2"])
+            self.assertEqual(resumed["turns"][0], original["turns"][0])
+            live = (root / "resumed" / flow.id / "live_trace.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn('"turn_id": "process-turn"', live)
+            self.assertEqual(resumed["token_budget"]["used"], original["token_budget"]["used"])
+
+    def _manifest(
+        self,
+        root: Path,
+        *,
+        violate_state_freeze: bool = False,
+        violate_start_turn: bool = False,
+        write_ignored_telemetry: bool = False,
+        incomplete_evolution: bool = False,
+        source_revision: str | None = None,
+        source_path: Path | None = None,
+    ) -> Path:
+        adapter = Path(__file__).parent / "fixtures" / "fake_baseline_adapter.py"
+        manifest = {
+            "schema_version": "1.0",
+            "id": "fake",
+            "adapter": {
+                "type": "process",
+                "command": [sys.executable, str(adapter)],
+                "cwd": "{repo_root}",
+                "timeout_seconds": 30,
+            },
+            "workspace": {"mode": "host_path", "adapter_path": "{workspace}"},
+            "state": {
+                "adapter_path": "{state_dir}",
+                "paths": ["learning/*", "learning/**/*"],
+                "ignore_paths": ["learning/telemetry.json"],
+                "enforce_turn_freeze": True,
+            },
+            "evolution": {"policy": "turn_boundary", "timeout_seconds": 30},
+            "options": {
+                "violate_state_freeze": violate_state_freeze,
+                "violate_start_turn": violate_start_turn,
+                "write_ignored_telemetry": write_ignored_telemetry,
+                "incomplete_evolution": incomplete_evolution,
+            },
+            "capabilities": ["direct_workspace", "usage", "evolution_barrier"],
+        }
+        if source_revision is not None:
+            manifest["source"] = {
+                "path": str(source_path or Path(__file__).parents[1]),
+                "revision": source_revision,
+            }
+        path = root / "fake.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _spec() -> BenchmarkSpec:
+        return BenchmarkSpec.from_dict({
+            "schema_version": "0.1",
+            "benchmark": {"max_total_tokens": 100},
+            "judge": {"type": "deterministic"},
+            "flows": [{
+                "id": "process-flow",
+                "sandbox": {"backend": "local"},
+                "metadata": {
+                    "private_marker": "must not leave the benchmark",
+                    "public": {"stream": "visible"},
+                },
+                "turns": [{
+                    "id": "process-turn",
+                    "request": "Create answer.txt.",
+                    "metadata": {
+                        "private_marker": "must not leave the benchmark",
+                        "public": {"category": "visible"},
+                    },
+                    "verifier": {
+                        "type": "file_contains",
+                        "path": "/workspace/answer.txt",
+                        "value": "process baseline",
+                    },
+                    "oracle_update": {"private_answer": "must not leave the benchmark"},
+                }],
+            }],
+        })
+
+    def test_process_runtime_runs_evolves_and_accounts_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec()
+            result = Runner(
+                spec,
+                output_dir=root / "runs",
+                baseline="fake",
+                baseline_manifest=str(self._manifest(root)),
+            ).run(spec.flows[0])
+
+            learned_path = root / "runs" / "process-flow" / "baseline_state" / "learning" / "process-turn.json"
+            learned = json.loads(learned_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["baseline"], "fake")
+        self.assertEqual(result["metrics"]["turn_success_rate"], 1.0)
+        self.assertEqual(result["token_budget"]["used"], 7)
+        self.assertEqual(result["token_budget"]["calls"], 2)
+        self.assertEqual(result["turns"][0]["evolution"]["changed_files"], ["learning/process-turn.json"])
+        public_interaction = learned["trajectory"][0]
+        self.assertNotIn("verifier_details", public_interaction)
+        self.assertNotIn("oracle_update", json.dumps(learned))
+        self.assertNotIn("private_marker", json.dumps(learned))
+        self.assertEqual(learned["flow_metadata"], {"stream": "visible"})
+        self.assertEqual(learned["turn_metadata"], {"category": "visible"})
+
+    def test_process_runtime_restores_illegal_foreground_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec()
+            result = Runner(
+                spec,
+                output_dir=root / "runs",
+                baseline="fake",
+                baseline_manifest=str(self._manifest(root, violate_state_freeze=True)),
+            ).run(spec.flows[0])
+            illegal = root / "runs" / "process-flow" / "baseline_state" / "learning" / "illegal.txt"
+            illegal_exists = illegal.exists()
+
+        interaction = result["turns"][0]["interactions"][0]
+        self.assertFalse(result["turns"][0]["passed"])
+        self.assertEqual(interaction["verifier_details"]["type"], "model_error")
+        self.assertIn("persistent learning state", interaction["feedback"])
+        self.assertEqual(interaction["usage"]["total_tokens"], 5)
+        self.assertFalse(illegal_exists)
+
+    def test_process_runtime_rejects_first_turn_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec()
+            runner = Runner(
+                spec,
+                output_dir=root / "runs",
+                baseline="fake",
+                baseline_manifest=str(self._manifest(root, violate_start_turn=True)),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "during start_turn"):
+                runner.run(spec.flows[0])
+
+    def test_process_runtime_ignores_declared_foreground_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec()
+            result = Runner(
+                spec,
+                output_dir=root / "runs",
+                baseline="fake",
+                baseline_manifest=str(self._manifest(root, write_ignored_telemetry=True)),
+            ).run(spec.flows[0])
+
+            exported = root / "runs" / "process-flow" / "baseline_state" / "learning" / "telemetry.json"
+
+        self.assertTrue(result["turns"][0]["passed"])
+        self.assertFalse(exported.exists())
+
+    def test_process_runtime_requires_completed_evolution_barrier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec()
+            runner = Runner(
+                spec,
+                output_dir=root / "runs",
+                baseline="fake",
+                baseline_manifest=str(self._manifest(root, incomplete_evolution=True)),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "evolution did not complete"):
+                runner.run(spec.flows[0])
+
+    def test_end_flow_exports_latest_volume_bytes_before_removing_volume(self) -> None:
+        from evolink_bench.docker_volume import DockerVolumeCapture
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = ProcessBaselineRuntime(
+                load_manifest(self._manifest(root)), budget=TokenBudget(limit=100), repo_root=root
+            )
+            runtime._state_dir = root / "state"
+            (runtime._state_dir / "learning").mkdir(parents=True)
+            (runtime._state_dir / "learning/stale.json").write_text("old")
+            output = root / "output"
+            output.mkdir()
+            runtime._flow = SimpleNamespace(output_dir=output)
+            content = b'{"latest":"written before interaction failure"}'
+            metadata = [{"path": "learning/latest.json", "size": len(content),
+                         "sha256": hashlib.sha256(content).hexdigest()}]
+            captures = []
+
+            def capture(_patterns, _ignored, *, include_bytes):
+                captures.append(include_bytes)
+                return DockerVolumeCapture(
+                    {"learning/latest.json": content} if include_bytes else {}, metadata
+                )
+
+            def close():
+                with zipfile.ZipFile(output / "baseline_state.zip") as bundle:
+                    self.assertEqual(bundle.namelist(), ["learning/latest.json"])
+                    self.assertEqual(bundle.read("learning/latest.json"), content)
+
+            runtime._state_volume = SimpleNamespace(capture_selected=capture, close=close)
+            runtime.end_flow()
+
+            self.assertEqual(captures, [True])
+            snapshot = json.loads((output / "baseline_state_snapshot.json").read_text())
+            self.assertEqual(snapshot["files"], metadata)
+            self.assertEqual((output / "baseline_state/learning/latest.json").read_bytes(), content)
+            self.assertIsNone(runtime._state_volume)
+
+    def test_process_runtime_archives_deep_state_on_windows_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = self._manifest(root)
+            runtime = ProcessBaselineRuntime(
+                load_manifest(manifest_path), budget=TokenBudget(limit=100), repo_root=root
+            )
+            runtime._state_dir = root / "state"
+            deep_name = "x" * 80
+            source = runtime._state_dir / "learning" / deep_name / "learned.json"
+            source.parent.mkdir(parents=True)
+            source.write_text("{}", encoding="utf-8")
+            output = root / ("run" * 60)
+            output.mkdir()
+
+            runtime._export_state(output, runtime.snapshot_state())
+
+            archive = output / "baseline_state.zip"
+            self.assertTrue(archive.exists())
+            with zipfile.ZipFile(archive) as bundle:
+                self.assertIn(f"learning/{deep_name}/learned.json", bundle.namelist())
+
+    def test_hermes_usage_converts_cumulative_tokens_but_not_per_run_calls(self) -> None:
+        bridge = HermesBridge()
+        first = bridge._usage_delta({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "api_calls": 2,
+        })
+        second = bridge._usage_delta({
+            "input_tokens": 160,
+            "output_tokens": 35,
+            "total_tokens": 195,
+            "api_calls": 2,
+        })
+
+        self.assertEqual(first["total_tokens"], 120)
+        self.assertEqual(second["total_tokens"], 75)
+        self.assertEqual(second["api_calls"], 2)
+
+    def test_hermes_explicit_disabled_thinking_reaches_acp_request_overrides(self) -> None:
+        agent = SimpleNamespace(request_overrides={"extra_body": {"existing": True}})
+        state = SimpleNamespace(agent=agent, session_id="session-1")
+        bridge = HermesBridge()
+        bridge.initialize({
+            "protocol_version": "1.0",
+            "evolution": {"policy": "disabled"},
+            "options": {"thinking": "disabled"},
+        })
+        bridge._manager = SimpleNamespace(create_session=lambda **_kwargs: state)
+        bridge._workspace = "/workspace"
+
+        bridge.start_turn({"turn_id": "turn-1", "metadata": {}})
+
+        self.assertEqual(agent.reasoning_config, {"enabled": False})
+        self.assertEqual(agent.request_overrides["extra_body"], {
+            "existing": True,
+            "thinking": {"type": "disabled"},
+            "reasoning": {"enabled": False},
+        })
+
+    def test_hermes_explicit_enabled_thinking_reaches_acp_request_overrides(self) -> None:
+        agent = SimpleNamespace(request_overrides={})
+        state = SimpleNamespace(agent=agent, session_id="session-1")
+        bridge = HermesBridge()
+        bridge.initialize({
+            "protocol_version": "1.0",
+            "evolution": {"policy": "disabled"},
+            "options": {"thinking": "enabled"},
+        })
+        bridge._manager = SimpleNamespace(create_session=lambda **_kwargs: state)
+        bridge._workspace = "/workspace"
+
+        bridge.start_turn({"turn_id": "turn-1", "metadata": {}})
+
+        self.assertEqual(agent.reasoning_config, {"enabled": True})
+        self.assertEqual(agent.request_overrides["extra_body"], {
+            "thinking": {"type": "enabled"},
+            "reasoning": {"enabled": True},
+        })
+
+    def test_hermes_failed_conversation_is_not_a_benchmark_response(self) -> None:
+        result = {
+            "failed": True,
+            "completed": False,
+            "final_response": "API call failed after 4 retries",
+            "error": "provider connect timeout",
+            "messages": [],
+            "api_calls": 4,
+        }
+        agent = SimpleNamespace(run_conversation=lambda **_kwargs: result)
+        state = SimpleNamespace(agent=agent, history=[], session_id="session-1", cwd="/workspace")
+        bridge = HermesBridge()
+        bridge._state = state
+        bridge._turn_id = "turn-1"
+        bridge._workspace = "/workspace"
+        bridge._is_taskstream_turn = True
+        bridge._manager = SimpleNamespace(save_session=lambda _session_id: None)
+        bridge._install_callbacks = lambda *_args: None
+        bridge._foreground_policy = lambda *_args: contextlib.nullcontext()
+
+        with self.assertRaisesRegex(RuntimeError, "provider connect timeout"):
+            bridge.interact({"turn_id": "turn-1", "request": "Do the task"})
+
+    def test_hermes_background_usage_counts_cache_tokens(self) -> None:
+        class Connection:
+            def execute(self, query, params):
+                return self
+
+            def fetchone(self):
+                return (10, 2, 3, 4, 5, 2, 0.25)
+
+        class ReadContext:
+            def __enter__(self):
+                return Connection()
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        class SessionDb:
+            def flush_token_counts(self):
+                pass
+
+            def _read_ctx(self):
+                return ReadContext()
+
+        agent = type("Agent", (), {"_session_db": SessionDb(), "session_id": "session-1"})()
+        usage = HermesBridge()._background_review_usage(agent)
+
+        self.assertEqual(usage["total_tokens"], 19)
+        self.assertEqual(usage["reasoning_tokens"], 5)
+        self.assertEqual(usage["api_calls"], 2)
+
+    def test_hermes_crosses_barrier_without_review_when_update_is_disabled(self) -> None:
+        bridge = HermesBridge()
+        bridge._state = SimpleNamespace(agent=SimpleNamespace())
+        bridge._turn_id = "turn-1"
+        bridge._turn_evolved = False
+        bridge._policy = "turn_boundary"
+        bridge._background_review_usage = lambda _agent: {}
+
+        result = bridge.evolve({
+            "turn_id": "turn-1",
+            "trajectory": [{"response": "done"}],
+            "feedback": [{"score": 1.0}],
+            "update_enabled": False,
+            "skip_reason": "condition:frozen",
+        })
+
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["events"], [{
+            "type": "evolution.skipped",
+            "policy": "turn_boundary",
+            "reason": "condition:frozen",
+        }])
+        self.assertTrue(bridge._turn_evolved)
+
+    def test_hermes_evolution_waits_for_full_review_worker_exit(self) -> None:
+        request_done = threading.Event()
+        request_done.set()
+        allow_worker_exit = threading.Event()
+        join_started = threading.Event()
+
+        class ReviewRun:
+            outcome = {"api_calls": 1}
+
+            def __init__(self) -> None:
+                self.request_done = request_done
+
+            def cancel(self) -> None:
+                raise AssertionError("completed review must not be cancelled")
+
+        class ReviewWorker:
+            def join(self, timeout=None) -> None:
+                join_started.set()
+                allow_worker_exit.wait(timeout)
+
+            def is_alive(self) -> bool:
+                return not allow_worker_exit.is_set()
+
+        bridge = HermesBridge()
+        bridge._state = SimpleNamespace(agent=SimpleNamespace(), history=[])
+        bridge._turn_id = "turn-1"
+        bridge._turn_evolved = False
+        bridge._policy = "turn_boundary"
+        bridge._review_timeout = 10
+        bridge._background_review_usage = lambda _agent: {}
+        bridge._spawn_turn_boundary_review = lambda *_args, **_kwargs: (
+            ReviewRun(),
+            ReviewWorker(),
+        )
+        result = {}
+
+        caller = threading.Thread(
+            target=lambda: result.update(bridge.evolve({
+                "turn_id": "turn-1",
+                "trajectory": [{"response": "done"}],
+                "feedback": [{"score": 1.0}],
+                "update_enabled": True,
+            })),
+            daemon=True,
+        )
+        caller.start()
+
+        self.assertTrue(join_started.wait(1))
+        self.assertTrue(caller.is_alive())
+        self.assertFalse(bridge._turn_evolved)
+
+        allow_worker_exit.set()
+        caller.join(timeout=1)
+
+        self.assertFalse(caller.is_alive())
+        self.assertTrue(result["completed"])
+        self.assertTrue(bridge._turn_evolved)
+
+    def test_hermes_explicit_review_returns_exact_worker_handle(self) -> None:
+        review_run = SimpleNamespace(request_done=threading.Event())
+        worker_finished = threading.Event()
+        seen = {}
+
+        def prepare(agent):
+            seen["prepared_agent"] = agent
+            return review_run
+
+        def finish(agent, run):
+            seen["finished"] = (agent, run)
+            run.request_done.set()
+
+        def spawn(agent, messages, **kwargs):
+            seen["spawn"] = (agent, messages, kwargs)
+
+            def target():
+                finish(agent, kwargs["review_run"])
+                worker_finished.set()
+
+            return target, "prompt"
+
+        background_review = types.ModuleType("agent.background_review")
+        background_review.prepare_background_review_run = prepare
+        background_review.finish_background_review_run = finish
+        background_review.spawn_background_review_thread = spawn
+        agent_package = types.ModuleType("agent")
+        agent_package.__path__ = []
+        agent_package.background_review = background_review
+        thread_context = types.ModuleType("tools.thread_context")
+        thread_context.propagate_context_to_thread = lambda target: target
+        tools_package = types.ModuleType("tools")
+        tools_package.__path__ = []
+        tools_package.thread_context = thread_context
+        parent_agent = SimpleNamespace()
+
+        with patch.dict(sys.modules, {
+            "agent": agent_package,
+            "agent.background_review": background_review,
+            "tools": tools_package,
+            "tools.thread_context": thread_context,
+        }):
+            returned_run, worker = HermesBridge._spawn_turn_boundary_review(
+                parent_agent,
+                messages_snapshot=[{"role": "user", "content": "task"}],
+                focus="learn from feedback",
+            )
+            worker.join(timeout=1)
+
+        self.assertIs(returned_run, review_run)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(worker_finished.is_set())
+        self.assertIs(seen["prepared_agent"], parent_agent)
+        self.assertEqual(seen["spawn"][1], [{"role": "user", "content": "task"}])
+        self.assertEqual(seen["spawn"][2]["focus"], "learn from feedback")
+        self.assertIs(seen["spawn"][2]["review_run"], review_run)
+
+    def test_hermes_evolution_timeout_cannot_release_a_live_writer(self) -> None:
+        cancelled = []
+        request_done = threading.Event()
+        request_done.set()
+        review_run = SimpleNamespace(
+            request_done=request_done,
+            cancel=lambda: cancelled.append(True),
+        )
+
+        class LiveWorker:
+            def join(self, timeout=None) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+        bridge = HermesBridge()
+        bridge._state = SimpleNamespace(agent=SimpleNamespace(), history=[])
+        bridge._turn_id = "turn-1"
+        bridge._turn_evolved = False
+        bridge._policy = "turn_boundary"
+        bridge._review_timeout = 0
+        bridge._background_review_usage = lambda _agent: {}
+        bridge._spawn_turn_boundary_review = lambda *_args, **_kwargs: (
+            review_run,
+            LiveWorker(),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "remained live after evolution timeout",
+        ):
+            bridge.evolve({
+                "turn_id": "turn-1",
+                "trajectory": [{"response": "done"}],
+                "feedback": [{"score": 1.0}],
+                "update_enabled": True,
+            })
+
+        self.assertEqual(cancelled, [True])
+        self.assertFalse(bridge._turn_evolved)
+
+    def test_hermes_l1_protocol_keeps_only_visible_text_and_normalizes_fact_aliases(self) -> None:
+        visible, state_update, calls, events, actions = _extract_l1_protocol(
+            "已创建会议。\n"
+            "TRIEVO_TOOL_CALL: {\"tool\": \"calendar.create_event\", \"arguments\": {\"calendar_id\": \"cal_delivery_team\"}}\n"
+            "TRIEVO_EVENT: {\"event\": \"asked_for_calendar_id\"}\n"
+            "TRIEVO_ACTION: {\"op\": \"write_file\", \"path\": \"/workspace/docs/a.txt\", \"content\": \"text\"}\n"
+            "TRIEVO_STATE_UPDATE: {\"facts\": {\"default_work_language\": {\"value\": \"zh-CN\"}, \"delivery_calendar_id\": {\"value\": \"cal_delivery_team\"}}}",
+            ["calendar.create_event"],
+        )
+
+        self.assertEqual(visible, "已创建会议。")
+        self.assertEqual(calls[0]["tool"], "calendar.create_event")
+        self.assertEqual(events, [{"event": "asked_for_calendar_id"}])
+        self.assertEqual(actions, [{"op": "write_file", "path": "/workspace/docs/a.txt", "content": "text"}])
+        self.assertIn("default_output_language", state_update["facts"])
+        self.assertIn("default_delivery_calendar_id", state_update["facts"])
+
+    def test_hermes_l1_readonly_context_is_scoped_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "docs").mkdir()
+            (workspace / "data").mkdir()
+            (workspace / "state").mkdir()
+            (workspace / "docs" / "source.txt").write_text("source material", encoding="utf-8")
+            (workspace / "data" / "large.txt").write_text("a" * 20_000, encoding="utf-8")
+            (workspace / "state" / "secret.txt").write_text("must not leak", encoding="utf-8")
+            (workspace / "unrelated.txt").write_text("must not leak either", encoding="utf-8")
+
+            context = _l1_readonly_workspace_context(workspace)
+
+        self.assertIn("FILE /workspace/docs/source.txt (read-only):\nsource material", context)
+        self.assertIn("FILE /workspace/data/large.txt (read-only):\n" + "a" * 16_000, context)
+        self.assertNotIn("a" * 16_001, context)
+        self.assertNotIn("must not leak", context)
+
+    def test_hermes_marks_l1_turns_from_metadata_even_without_simulated_tools(self) -> None:
+        self.assertTrue(_is_l1_metadata({"source_format": "l1_demo_task_json", "available_tools": []}))
+        self.assertFalse(_is_l1_metadata({"available_tools": []}))
+
+    def test_llm_judge_receives_prior_interactions_as_evidence(self) -> None:
+        class CapturingClient:
+            def __init__(self) -> None:
+                self.messages: list[dict[str, str]] = []
+
+            def complete(self, messages, **kwargs):
+                self.messages = messages
+                return '{"score": 1, "passed": true, "feedback": "ok"}'
+
+        client = CapturingClient()
+        sandbox = LocalSandbox()
+        try:
+            LLMJudge(client, "unused").evaluate(
+                {"type": "llm_rubric", "rubric": "Judge {final_response}"},
+                "created the event",
+                sandbox,
+                {"interactions": [{"index": 1, "response": "Which calendar ID should I use?", "events": [{"event": "asked_for_calendar_id"}]}]},
+            )
+        finally:
+            sandbox.close()
+
+        prompt = client.messages[1]["content"]
+        self.assertIn("当前 Turn 已发生的 interaction 轨迹", prompt)
+        self.assertIn("asked_for_calendar_id", prompt)
+
+    def test_hermes_l1_state_context_preserves_prior_facts_and_history(self) -> None:
+        state = _merge_l1_state(
+            {"facts": {"default_delivery_calendar_id": {"value": "cal_delivery_team"}}},
+            {"facts": {"default_output_language": {"value": "en-US"}}, "fact_history": [{"key": "default_output_language"}]},
+        )
+
+        context = _l1_persistent_state_context(state)
+
+        self.assertIn("cal_delivery_team", context)
+        self.assertIn("en-US", context)
+        self.assertEqual(state["fact_history"], [{"key": "default_output_language"}])
+
+    def test_hermes_l1_file_create_content_becomes_auditable_write_action(self) -> None:
+        actions = _complete_l1_file_actions(
+            [{"tool": "file.create_file", "arguments": {"filename": "/workspace/docs/a.txt", "content": "complete text"}}],
+            [],
+        )
+
+        self.assertEqual(actions, [{"op": "write_file", "path": "/workspace/docs/a.txt", "content": "complete text"}])
+
+    def test_process_runtime_rejects_source_revision_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "EvoLink-Bench Test"], check=True)
+            (source / "tracked.txt").write_text("fixture", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "fixture"], check=True)
+            spec = self._spec()
+            runner = Runner(
+                spec,
+                output_dir=root / "runs",
+                baseline="fake",
+                baseline_manifest=str(self._manifest(root, source_revision="0" * 40, source_path=source)),
+            )
+            with self.assertRaisesRegex(RuntimeError, "revision mismatch"):
+                runner.run(spec.flows[0])
+
+    def test_process_runtime_rejects_dirty_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "EvoLink-Bench Test"], check=True)
+            (source / "tracked.txt").write_text("tracked", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "fixture"], check=True)
+            revision = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            (source / "untracked.txt").write_text("dirty", encoding="utf-8")
+            spec = self._spec()
+            runner = Runner(
+                spec,
+                output_dir=root / "runs",
+                baseline="fake",
+                baseline_manifest=str(self._manifest(root, source_revision=revision, source_path=source)),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "source tree is dirty"):
+                runner.run(spec.flows[0])
+
+    def test_baseline_selection_removes_control_fields_from_manifest_overrides(self) -> None:
+        spec = BenchmarkSpec.from_dict({
+            "schema_version": "0.1",
+            "baseline": {
+                "type": "fake",
+                "manifest": "baseline.json",
+                "options": {"from_spec": True},
+            },
+            "flows": [{
+                "id": "selection-flow",
+                "sandbox": {"backend": "local"},
+                "turns": [{
+                    "id": "selection-turn",
+                    "request": "request",
+                    "verifier": {"type": "file_contains", "path": "/workspace/x", "value": "x"},
+                }],
+            }],
+        })
+
+        baseline_id, manifest, overrides = resolve_baseline_selection(
+            spec,
+            baseline_override="fake",
+            agent_override=None,
+            config_override={"type": "ignored", "manifest": "ignored.json", "options": {"from_cli": True}},
+            manifest_override=None,
+        )
+
+        self.assertEqual(baseline_id, "fake")
+        self.assertEqual(manifest, "ignored.json")
+        self.assertNotIn("type", overrides)
+        self.assertNotIn("manifest", overrides)
+        self.assertEqual(overrides["options"], {"from_spec": True, "from_cli": True})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,2 @@
+FROM evolink-hermes-l2-evolution-taskstream:0.6
+COPY evolink_bench/baselines/hermes_bridge.py /opt/evolink/evolink_bench/baselines/hermes_bridge.py

@@ -1,0 +1,575 @@
+"""Docker-daemon-owned volume transport for nested/rootless environments.
+
+The Docker client can stream files with ``docker cp`` even when the daemon
+cannot resolve the client's host paths for bind mounts. This mirror keeps the
+existing host-side checkpoint model while containers share a named volume
+owned by the daemon.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import uuid
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Any, Mapping
+
+
+class DockerVolumeError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class DockerVolumeCapture:
+    files: dict[str, bytes]
+    metadata: list[dict[str, Any]]
+
+
+_TRUE_VALUES = {"1", "true", "yes", "on", "required"}
+_FALSE_VALUES = {"", "0", "false", "no", "off", "disabled"}
+_MAX_STORAGE_COPY_FAILURES = 5
+_STORAGE_ERROR_PATTERNS = (
+    "no space left on device",
+    "error setting up pivot dir",
+    "input/output error",
+    "stale file handle",
+    "transport endpoint is not connected",
+)
+
+
+def docker_volume_transport_enabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environ is None else environ
+    raw = source.get("TRIEVO_DOCKER_VOLUME_TRANSPORT", "off").strip().lower()
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    accepted = ", ".join(repr(value) for value in sorted(_TRUE_VALUES | _FALSE_VALUES))
+    raise DockerVolumeError(
+        f"TRIEVO_DOCKER_VOLUME_TRANSPORT must be one of: {accepted}"
+    )
+
+
+@dataclass
+class DockerVolumeMirror:
+    """A host mirror synchronized through a private Docker carrier container."""
+
+    host_path: Path
+    role: str
+    volume_name: str
+    carrier_name: str
+    helper_image: str
+    uid: int
+    gid: int
+    _closed: bool = False
+    _storage_gate: Any | None = field(default=None, repr=False)
+
+    @classmethod
+    def create(
+        cls,
+        host_path: Path,
+        *,
+        role: str,
+        writable_uid: int | None = None,
+        writable_gid: int | None = None,
+        helper_image: str | None = None,
+    ) -> "DockerVolumeMirror":
+        requested = host_path.expanduser()
+        if requested.is_symlink():
+            raise DockerVolumeError(
+                f"Docker volume mirror does not accept a symlink root: {requested}"
+            )
+        source = requested.resolve()
+        if not source.is_dir():
+            raise DockerVolumeError(
+                f"Docker volume mirror requires a directory: {source}"
+            )
+        safe_role = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "data"
+        suffix = uuid.uuid4().hex[:12]
+        volume_name = f"evolink-{safe_role}-{suffix}"
+        carrier_name = f"evolink-{safe_role}-carrier-{suffix}"
+        image = helper_image or os.environ.get(
+            "TRIEVO_DOCKER_TRANSFER_IMAGE", "evolink-l2:0.1"
+        )
+        uid = writable_uid if writable_uid is not None else _host_uid()
+        gid = writable_gid if writable_gid is not None else _host_gid()
+        mirror = cls(
+            source,
+            safe_role,
+            volume_name,
+            carrier_name,
+            image,
+            uid,
+            gid,
+            _storage_gate=_storage_gate_from_environment(),
+        )
+        try:
+            mirror._create_resources()
+            mirror.sync_from_host()
+            return mirror
+        except BaseException:
+            mirror.close()
+            raise
+
+    def mount(self, target: str, *, read_only: bool = False) -> str:
+        if not target.startswith("/"):
+            raise DockerVolumeError("container volume target must be absolute")
+        suffix = ":ro" if read_only else ""
+        return f"{self.volume_name}:{target}{suffix}"
+
+    def mount_spec(self, target: str, *, read_only: bool = False) -> str:
+        """Return an unambiguous Docker ``--mount`` specification."""
+        if not target.startswith("/"):
+            raise DockerVolumeError("container volume target must be absolute")
+        suffix = ",readonly" if read_only else ""
+        return f"type=volume,src={self.volume_name},dst={target}{suffix}"
+
+    def sync_from_host(self) -> None:
+        self._require_open()
+
+        def copy() -> None:
+            _run_docker(
+                ["exec", self.carrier_name, "python3", "-c", _CLEAR_VOLUME_SCRIPT]
+            )
+            _run_docker(["cp", f"{self.host_path}/.", f"{self.carrier_name}:/volume"])
+            _run_docker(
+                [
+                    "exec",
+                    self.carrier_name,
+                    "chown",
+                    "-R",
+                    f"{self.uid}:{self.gid}",
+                    "/volume",
+                ]
+            )
+
+        self._copy_with_storage_gate(copy)
+
+    def sync_to_host(self) -> None:
+        self._require_open()
+
+        def copy() -> None:
+            staged = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{self.host_path.name}-docker-pull-",
+                    dir=self.host_path.parent,
+                )
+            )
+            backup = self.host_path.parent / (
+                f".{self.host_path.name}-docker-backup-{uuid.uuid4().hex[:12]}"
+            )
+            try:
+                _run_docker(["cp", f"{self.carrier_name}:/volume/.", str(staged)])
+                shutil.copystat(self.host_path, staged, follow_symlinks=False)
+                self.host_path.rename(backup)
+                try:
+                    staged.rename(self.host_path)
+                except BaseException:
+                    backup.rename(self.host_path)
+                    raise
+                shutil.rmtree(backup, ignore_errors=True)
+            finally:
+                shutil.rmtree(staged, ignore_errors=True)
+
+        self._copy_with_storage_gate(copy)
+
+    def capture_selected(
+        self,
+        patterns: list[str],
+        ignore_patterns: list[str],
+        *,
+        include_bytes: bool,
+    ) -> DockerVolumeCapture:
+        """Hash or fetch only declared files without copying the whole volume."""
+        self._require_open()
+        selection = _selection_payload(patterns, ignore_patterns)
+        completed: subprocess.CompletedProcess[str] | None = None
+
+        def capture() -> None:
+            nonlocal completed
+            completed = _run_docker(
+                [
+                    "exec",
+                    self.carrier_name,
+                    "python3",
+                    "-c",
+                    _CAPTURE_SELECTED_SCRIPT,
+                    json.dumps(selection, separators=(",", ":")),
+                    "1" if include_bytes else "0",
+                ]
+            )
+
+        self._copy_with_storage_gate(capture)
+        if completed is None:
+            raise DockerVolumeError("Docker selective state capture did not run")
+        try:
+            raw_items = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise DockerVolumeError("Docker selective state capture returned invalid JSON") from exc
+        if not isinstance(raw_items, list):
+            raise DockerVolumeError("Docker selective state capture must return a list")
+        files: dict[str, bytes] = {}
+        metadata: list[dict[str, Any]] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                raise DockerVolumeError("Docker selective state capture returned a non-object item")
+            relative = _safe_archive_name(str(raw.get("path", "")))
+            try:
+                size = int(raw["size"])
+                digest = str(raw["sha256"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DockerVolumeError("Docker selective state capture metadata is invalid") from exc
+            item = {"path": relative, "size": size, "sha256": digest}
+            metadata.append(item)
+            if include_bytes:
+                encoded = raw.get("content")
+                if not isinstance(encoded, str):
+                    raise DockerVolumeError(f"Docker state capture omitted content for {relative}")
+                try:
+                    content = base64.b64decode(encoded, validate=True)
+                except ValueError as exc:
+                    raise DockerVolumeError(f"Docker state capture corrupted content for {relative}") from exc
+                if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+                    raise DockerVolumeError(f"Docker state capture digest mismatch for {relative}")
+                files[relative] = content
+        metadata.sort(key=lambda item: str(item["path"]))
+        return DockerVolumeCapture(files=files, metadata=metadata)
+
+    def sync_selected_from_host(
+        self,
+        patterns: list[str],
+        ignore_patterns: list[str],
+    ) -> None:
+        """Replace only declared paths in the volume, preserving all other state."""
+        self._require_open()
+        selection = _selection_payload(patterns, ignore_patterns)
+
+        def copy() -> None:
+            with tempfile.TemporaryDirectory(prefix="evolink-selected-state-") as temporary:
+                archive = Path(temporary) / "state.zip"
+                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+                    for relative, path in _selected_host_files(
+                        self.host_path,
+                        selection["patterns"],
+                        selection["ignore_patterns"],
+                    ):
+                        bundle.write(path, arcname=relative)
+                remote_archive = f"/tmp/evolink-state-{uuid.uuid4().hex}.zip"
+                _run_docker(["cp", str(archive), f"{self.carrier_name}:{remote_archive}"])
+                _run_docker(
+                    [
+                        "exec",
+                        self.carrier_name,
+                        "python3",
+                        "-c",
+                        _RESTORE_SELECTED_SCRIPT,
+                        json.dumps(selection, separators=(",", ":")),
+                        remote_archive,
+                        str(self.uid),
+                        str(self.gid),
+                    ]
+                )
+
+        self._copy_with_storage_gate(copy)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        _run_docker(["rm", "-f", self.carrier_name], check=False)
+        _run_docker(["volume", "rm", "-f", self.volume_name], check=False)
+
+    def _create_resources(self) -> None:
+        _run_docker(
+            [
+                "volume",
+                "create",
+                "--label",
+                "io.trievo.managed=true",
+                "--label",
+                f"io.trievo.role={self.role}",
+                self.volume_name,
+            ]
+        )
+        _run_docker(
+            [
+                "run",
+                "-d",
+                "--name",
+                self.carrier_name,
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "CHOWN",
+                "--cap-add",
+                "DAC_OVERRIDE",
+                "--security-opt",
+                "no-new-privileges",
+                "--pids-limit",
+                "64",
+                "--memory",
+                "256m",
+                "--cpus",
+                "1",
+                "--mount",
+                self.mount_spec("/volume"),
+                self.helper_image,
+                "sleep",
+                "infinity",
+            ]
+        )
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise DockerVolumeError("Docker volume mirror is closed")
+
+    def _copy_with_storage_gate(self, operation) -> None:
+        gate = self._storage_gate
+        if gate is None:
+            operation()
+            return
+        failures = 0
+        while True:
+            gate.wait()
+            try:
+                operation()
+                return
+            except BaseException as exc:
+                if not _is_storage_error(exc):
+                    raise
+                failures += 1
+                gate.trip(str(exc))
+                if failures >= _MAX_STORAGE_COPY_FAILURES:
+                    raise
+
+
+_CLEAR_VOLUME_SCRIPT = """
+from pathlib import Path
+import shutil
+
+root = Path('/volume')
+for child in root.iterdir():
+    if child.is_dir() and not child.is_symlink():
+        shutil.rmtree(child)
+    else:
+        child.unlink(missing_ok=True)
+""".strip()
+
+
+_CAPTURE_SELECTED_SCRIPT = r"""
+import base64
+import hashlib
+import json
+import sys
+from pathlib import Path, PurePosixPath
+
+root = Path('/volume')
+spec = json.loads(sys.argv[1])
+include_bytes = sys.argv[2] == '1'
+found = {}
+for pattern in spec['patterns']:
+    for path in root.glob(pattern):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if any(PurePosixPath(relative).match(item) for item in spec['ignore_patterns']):
+            continue
+        found[relative] = path
+items = []
+for relative, path in sorted(found.items()):
+    content = path.read_bytes()
+    item = {
+        'path': relative,
+        'size': len(content),
+        'sha256': hashlib.sha256(content).hexdigest(),
+    }
+    if include_bytes:
+        item['content'] = base64.b64encode(content).decode('ascii')
+    items.append(item)
+print(json.dumps(items, separators=(',', ':')))
+""".strip()
+
+
+_RESTORE_SELECTED_SCRIPT = r"""
+import json
+import os
+import shutil
+import sys
+import zipfile
+from pathlib import Path, PurePosixPath
+
+root = Path('/volume').resolve()
+spec = json.loads(sys.argv[1])
+archive = Path(sys.argv[2])
+uid = int(sys.argv[3])
+gid = int(sys.argv[4])
+try:
+    found = {}
+    for pattern in spec['patterns']:
+        for path in root.glob(pattern):
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if any(PurePosixPath(relative).match(item) for item in spec['ignore_patterns']):
+                continue
+            found[relative] = path
+    for path in found.values():
+        path.unlink(missing_ok=True)
+    with zipfile.ZipFile(archive) as bundle:
+        for info in bundle.infolist():
+            relative = PurePosixPath(info.filename)
+            if relative.is_absolute() or '..' in relative.parts or info.is_dir():
+                continue
+            target = (root / Path(*relative.parts)).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError('state archive path escapes volume')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(bundle.read(info))
+            os.chmod(target, 0o644)
+            os.chown(target, uid, gid)
+            parent = target.parent
+            while parent != root:
+                os.chown(parent, uid, gid)
+                parent = parent.parent
+finally:
+    archive.unlink(missing_ok=True)
+""".strip()
+
+
+def _selection_payload(
+    patterns: list[str],
+    ignore_patterns: list[str],
+) -> dict[str, list[str]]:
+    selected = [_safe_selection_pattern(item) for item in patterns]
+    ignored = [_safe_selection_pattern(item) for item in ignore_patterns]
+    return {"patterns": selected, "ignore_patterns": ignored}
+
+
+def _safe_selection_pattern(value: str) -> str:
+    pattern = str(value).replace("\\", "/").strip()
+    posix = PurePosixPath(pattern)
+    if not pattern or posix.is_absolute() or ".." in posix.parts:
+        raise DockerVolumeError(f"unsafe Docker volume selection pattern: {value!r}")
+    return pattern
+
+
+def _safe_archive_name(value: str) -> str:
+    posix = PurePosixPath(value)
+    if not value or posix.is_absolute() or ".." in posix.parts:
+        raise DockerVolumeError(f"unsafe Docker volume capture path: {value!r}")
+    return posix.as_posix()
+
+
+def _selected_host_files(
+    root: Path,
+    patterns: list[str],
+    ignore_patterns: list[str],
+) -> list[tuple[str, Path]]:
+    found: dict[str, Path] = {}
+    root_resolved = root.resolve()
+    for pattern in patterns:
+        for path in root.glob(pattern):
+            if not path.is_file() or path.is_symlink():
+                continue
+            resolved = path.resolve()
+            if resolved != root_resolved and root_resolved not in resolved.parents:
+                continue
+            relative = resolved.relative_to(root_resolved).as_posix()
+            if any(PurePosixPath(relative).match(item) for item in ignore_patterns):
+                continue
+            found[relative] = resolved
+    return sorted(found.items())
+
+
+def _docker_executable() -> str:
+    configured = os.environ.get("DOCKER_EXE", "").strip()
+    if configured:
+        return configured
+    resolved = shutil.which("docker")
+    if resolved is None:
+        raise DockerVolumeError("docker executable was not found")
+    return resolved
+
+
+def _run_docker(
+    args: list[str],
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        completed = subprocess.run(
+            [_docker_executable(), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if check:
+            raise DockerVolumeError(f"Docker volume command failed: {args[0]}") from exc
+        return subprocess.CompletedProcess(args, 1, "", str(exc))
+    if check and completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout)[-4000:]
+        raise DockerVolumeError(
+            f"Docker volume command failed ({args[0]}): {detail.strip()}"
+        )
+    return completed
+
+
+def _storage_recovery_module():
+    try:
+        from . import storage_recovery  # type: ignore[attr-defined]
+    except ImportError:
+        if os.environ.get("TRIEVO_STORAGE_GUARD") == "1":
+            raise
+        return None
+    return storage_recovery
+
+
+def _storage_gate_from_environment():
+    module = _storage_recovery_module()
+    if module is None:
+        if os.environ.get("TRIEVO_STORAGE_GUARD") == "1":
+            raise DockerVolumeError("storage guard requested but unavailable")
+        return None
+    factory = getattr(module, "from_environment", None)
+    if callable(factory):
+        return factory()
+    storage_gate = getattr(module, "StorageGate", None)
+    class_factory = getattr(storage_gate, "from_environment", None)
+    if callable(class_factory):
+        return class_factory()
+    if os.environ.get("TRIEVO_STORAGE_GUARD") == "1":
+        raise DockerVolumeError("storage guard requested but factory unavailable")
+    return None
+
+
+def _is_storage_error(exc_or_str: BaseException | str) -> bool:
+    module = _storage_recovery_module()
+    detector = getattr(module, "is_storage_error", None) if module is not None else None
+    if callable(detector):
+        return bool(detector(exc_or_str))
+    text = str(exc_or_str).lower()
+    return any(pattern in text for pattern in _STORAGE_ERROR_PATTERNS)
+
+
+def _host_uid() -> int:
+    return os.getuid() if hasattr(os, "getuid") else 1000
+
+
+def _host_gid() -> int:
+    return os.getgid() if hasattr(os, "getgid") else 1000

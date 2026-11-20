@@ -1,0 +1,1224 @@
+from __future__ import annotations
+
+import contextlib
+import copy
+import functools
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Callable
+
+from .base import RUNTIME_PROTOCOL_VERSION
+
+
+class HermesBridge:
+    """EvoLink-Bench protocol bridge backed by Hermes' ACP SessionManager."""
+
+    def __init__(self, session_manager_factory: Callable[[], Any] | None = None) -> None:
+        self._session_manager_factory = session_manager_factory
+        self._manager: Any = None
+        self._state: Any = None
+        self._workspace: str | None = None
+        self._turn_id: str | None = None
+        self._turn_evolved = False
+        self._policy = "turn_boundary"
+        self._review_timeout = 900.0
+        self._bounded_evolution_barrier = False
+        self._evolution_teardown_grace = 10.0
+        self._evolution_unusable = False
+        self._active_review_run: Any = None
+        self._evolution_phase = "idle"
+        self._approval_policy = "session"
+        self._thinking = ""
+        self._last_usage: dict[str, float] = {}
+        self._events: list[dict[str, Any]] = []
+        self._tool_calls: list[dict[str, Any]] = []
+        self._turn_limits: dict[str, int] = {}
+        self._limit_state: dict[str, Any] = {}
+        self._l1_tools: list[str] = []
+        self._is_l1_turn = False
+        self._is_taskstream_turn = False
+        self._is_l1_life_turn = False
+        self._l1_state: dict[str, Any] = {}
+        self._task_terminal_socket: str | None = None
+
+    def dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        handler = getattr(self, method, None)
+        if handler is None or method.startswith("_"):
+            raise RuntimeError(f"unsupported bridge method: {method}")
+        result = handler(params)
+        if not isinstance(result, dict):
+            raise RuntimeError(f"bridge method {method} returned a non-object")
+        return result
+
+    def initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        requested = str(params.get("protocol_version", ""))
+        if requested != RUNTIME_PROTOCOL_VERSION:
+            raise RuntimeError(
+                f"unsupported runtime protocol {requested!r}; expected {RUNTIME_PROTOCOL_VERSION}"
+            )
+        evolution = params.get("evolution", {})
+        options = params.get("options", {})
+        if isinstance(evolution, dict):
+            self._policy = str(evolution.get("policy", "turn_boundary"))
+            self._review_timeout = float(evolution.get("timeout_seconds", 900))
+        if isinstance(options, dict):
+            self._bounded_evolution_barrier = options.get("bounded_evolution_barrier") is True
+            self._approval_policy = str(options.get("approval_policy", "session"))
+            self._thinking = str(options.get("thinking", "")).strip().lower()
+        if self._policy not in {"turn_boundary", "native", "disabled"}:
+            raise RuntimeError(f"unsupported Hermes evolution policy: {self._policy}")
+        if self._approval_policy not in {"once", "session", "always", "deny"}:
+            raise RuntimeError(f"unsupported Hermes approval policy: {self._approval_policy}")
+        if self._thinking not in {"", "enabled", "disabled"}:
+            raise RuntimeError(f"unsupported Hermes thinking mode: {self._thinking}")
+        return {
+            "protocol_version": RUNTIME_PROTOCOL_VERSION,
+            "adapter": "hermes-session-manager",
+            "capabilities": ["direct_workspace", "events", "usage", "memory", "skills", "evolution_barrier"],
+        }
+
+    def start_flow(self, params: dict[str, Any]) -> dict[str, Any]:
+        workspace = Path(str(params.get("workspace", ""))).resolve()
+        if not workspace.is_dir():
+            raise RuntimeError(f"Hermes workspace does not exist: {workspace}")
+        hermes_home = Path(os.environ.get("HERMES_HOME", "")).resolve()
+        if not str(os.environ.get("HERMES_HOME", "")).strip():
+            raise RuntimeError("HERMES_HOME must be set for an isolated Hermes flow")
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        if self._session_manager_factory is None:
+            if os.environ.get("TRIEVO_SLOW_PROVIDER") == "1":
+                from run_agent import AIAgent
+                _install_slow_provider_policy(AIAgent)
+            from acp_adapter.session import SessionManager
+
+            self._manager = SessionManager()
+        else:
+            self._manager = self._session_manager_factory()
+        self._workspace = str(workspace)
+        self._l1_state = {}
+        return {
+            "framework": "hermes-agent",
+            "workspace": self._workspace,
+            "evolution_policy": self._policy,
+        }
+
+    def start_turn(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self._evolution_unusable:
+            raise RuntimeError("Hermes evolution did not quiesce; this runtime cannot start another Turn")
+        if self._manager is None or self._workspace is None:
+            raise RuntimeError("Hermes flow has not started")
+        from evolink_bench.task_terminal import SCHEMA, socket_from_metadata
+        self._task_terminal_socket = socket_from_metadata(params)
+        if self._state is not None:
+            if not self._turn_evolved:
+                raise RuntimeError(f"Hermes turn {self._turn_id} has not crossed the evolution barrier")
+            self._close_current_session()
+        state = self._manager.create_session(cwd=self._workspace)
+        agent = state.agent
+        if (params.get("metadata") or {}).get("slow_provider") is True:
+            _configure_slow_provider_agent(agent)
+        agent.skip_background_review = self._policy != "native"
+        if self._policy == "turn_boundary":
+            agent._memory_nudge_interval = 0
+            agent._skill_nudge_interval = 0
+        self._turn_limits = _parse_l2_agent_limits(params.get("metadata"))
+        metadata = params.get("metadata")
+        self._l1_tools = [str(item) for item in metadata.get("available_tools", [])] if isinstance(metadata, dict) and isinstance(metadata.get("available_tools"), list) else []
+        self._is_l1_turn = _is_l1_metadata(metadata)
+        self._is_taskstream_turn = _is_taskstream_metadata(metadata)
+        self._is_l1_life_turn = _is_l1_life_metadata(metadata)
+        semantic_state = params.get("semantic_state", {})
+        self._l1_state = dict(semantic_state) if self._is_l1_turn and not self._is_taskstream_turn and isinstance(semantic_state, dict) else {}
+        # Apply the selected provider profile to every turn, including L2 and
+        # the same-model evolution fork. An empty legacy value keeps the
+        # historical non-thinking behavior.
+        thinking_enabled = self._thinking == "enabled"
+        agent.reasoning_config = {"enabled": thinking_enabled}
+        if self._thinking in {"enabled", "disabled"}:
+            # Hermes' ACP SessionManager currently keeps provider credentials
+            # but drops custom-provider request_overrides.  Reapply the
+            # benchmark's explicit wire control without modifying upstream.
+            request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+            extra_body = dict(request_overrides.get("extra_body", {}) or {})
+            extra_body.update({
+                "thinking": {"type": self._thinking},
+                "reasoning": {"enabled": thinking_enabled},
+            })
+            request_overrides["extra_body"] = extra_body
+            agent.request_overrides = request_overrides
+        if self._is_l1_turn:
+            # L1 already controls retries through max_interactions.  Give the
+            # framework exactly one foreground decision per Interaction: an
+            # inner tool/reasoning loop would otherwise make one simulated
+            # L1 retry consume several model calls before the evaluator can
+            # supply its scripted follow-up or feedback.
+            agent.max_iterations = 1
+            # L1's calendar, messaging and file calls are evaluator-owned
+            # simulated tools, serialised in the final response as protocol
+            # lines and executed by Runner._apply_tool_calls.  Passing
+            # Hermes' large native tool schema here both wastes context and
+            # invites the model to mutate the real workspace instead of using
+            # the auditable simulated interface.
+            if not self._is_taskstream_turn:
+                agent.valid_tool_names = set()
+            # Hermes' normal interactive UX retries length-truncated output
+            # and then asks for a summary.  Those are extra model calls that
+            # bypass L1's max_interactions contract, so return the partial
+            # result to the evaluator instead.
+            agent.max_length_continue_retries = 0
+        self._limit_state = {"tool_starts": 0, "reasons": []}
+        if self._turn_limits:
+            # Hermes reserves one no-tools call to request a concise final
+            # answer after its iteration budget is depleted.  Leave that
+            # grace call inside the benchmark's advertised model-call cap.
+            if not self._is_l1_turn or self._is_taskstream_turn:
+                agent.max_iterations = max(1, self._turn_limits["max_model_calls"] - 1)
+            agent.run_budget_seconds = float(self._turn_limits["episode_timeout_seconds"])
+            output_cap = self._turn_limits.get("max_output_tokens")
+            if output_cap is not None:
+                configured = getattr(agent, "max_tokens", None)
+                agent.max_tokens = (
+                    int(output_cap)
+                    if configured is None
+                    else min(int(configured), int(output_cap))
+                )
+            agent._trievo_evolution_limits = {
+                "max_model_calls": self._turn_limits["evolution_max_model_calls"],
+                "timeout_seconds": self._turn_limits["evolution_timeout_seconds"],
+            }
+        self._state = state
+        self._turn_id = str(params.get("turn_id", ""))
+        self._turn_evolved = False
+        self._last_usage = {}
+        return {"session_id": state.session_id, "fresh_session": True,
+                **({"task_terminal_transport": SCHEMA} if self._task_terminal_socket else {})}
+
+    def interact(self, params: dict[str, Any]) -> dict[str, Any]:
+        state = self._require_turn(str(params.get("turn_id", "")))
+        request = str(params.get("request", ""))
+        if not request:
+            raise RuntimeError("Hermes interaction request is empty")
+        # Contract limits are per Interaction, not cumulative across all retry
+        # messages in the Turn.
+        self._limit_state = {"tool_starts": 0, "reasons": []}
+        self._events = []
+        self._tool_calls = []
+        if self._is_l1_turn and not self._is_taskstream_turn:
+            request = (
+                _l1_protocol_prompt(self._l1_tools, self._is_l1_life_turn)
+                + _l1_readonly_workspace_context(Path(self._workspace or state.cwd))
+                + _l1_persistent_state_context(self._l1_state)
+                + "\n\n"
+                + request
+            )
+        agent = state.agent
+        self._install_callbacks(agent)
+        with self._foreground_policy(agent, state.session_id, state.cwd, self._turn_limits):
+            result = agent.run_conversation(
+                user_message=request,
+                conversation_history=state.history,
+                task_id=state.session_id,
+                persist_user_message=request,
+            )
+        if not isinstance(result, dict):
+            raise RuntimeError("Hermes returned a non-object conversation result")
+        if isinstance(result.get("messages"), list):
+            state.history = result["messages"]
+            self._manager.save_session(state.session_id)
+        usage = self._usage_delta(result)
+        limit_reasons = list(self._limit_state.get("reasons", []))
+        if self._turn_limits and int(result.get("api_calls", 0) or 0) >= self._turn_limits["max_model_calls"]:
+            limit_reasons.append("max_model_calls")
+        limit_reasons = list(dict.fromkeys(limit_reasons))
+        # Hermes attaches a human-facing final_response to provider, timeout,
+        # policy, and context failures.  It is diagnostic text, not a model
+        # submission; evaluating it would consume a benchmark Interaction.
+        if result.get("failed"):
+            raise RuntimeError(str(result.get("error") or "Hermes conversation failed"))
+        if self._is_taskstream_turn:
+            # TaskStream is a bounded native-tool interaction.  It shares the
+            # one-iteration limit with L1, but its evaluator expects Hermes'
+            # ordinary final text and callback tool trace, not TRIEVO protocol
+            # lines or simulated side effects.
+            text = str(result.get("final_response", ""))
+            state_update = {}
+            simulated_calls = []
+            protocol_events = []
+            actions = []
+        else:
+            text, state_update, simulated_calls, protocol_events, actions = _extract_l1_protocol(
+                str(result.get("final_response", "")), self._l1_tools
+            )
+            actions = _complete_l1_file_actions(simulated_calls, actions)
+            self._l1_state = _merge_l1_state(self._l1_state, state_update)
+        return {
+            "text": text,
+            "actions": actions if self._is_l1_turn else [],
+            # L1 side effects are exclusively evaluator-owned protocol lines.
+            # Ignore native Hermes callbacks, including malformed speculative
+            # calls, so they cannot create duplicate simulated events.
+            "events": protocol_events if (self._is_l1_turn and not self._is_taskstream_turn) else self._events,
+            "tool_calls": simulated_calls if (self._is_l1_turn and not self._is_taskstream_turn) else self._tool_calls,
+            "state_update": state_update,
+            "tool_calls_are_executed": not bool(simulated_calls) if (self._is_l1_turn and not self._is_taskstream_turn) else True,
+            "actions_are_executed": not bool(actions) if (self._is_l1_turn and not self._is_taskstream_turn) else True,
+            "usage": usage,
+            "raw": {
+                "completed": bool(result.get("completed", False)),
+                "failed": bool(result.get("failed", False)),
+                "turn_exit_reason": result.get("turn_exit_reason"),
+                "model": result.get("model"),
+                "provider": result.get("provider"),
+                "work_limits": self._turn_limits,
+                "limit_exhausted": bool(limit_reasons),
+                "limit_reasons": limit_reasons,
+            },
+        }
+
+    def evolve(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._bounded_evolution_barrier:
+            return self._evolve_once(params)
+        self._require_turn(str(params.get("turn_id", "")))
+        if self._evolution_unusable:
+            raise RuntimeError("Hermes evolution runtime is unusable after an earlier timeout")
+        timeout = float(self._turn_limits.get("evolution_timeout_seconds", self._review_timeout))
+        deadline = time.monotonic() + timeout
+        results: queue.Queue[tuple[bool, Any]] = queue.Queue()
+        self._evolution_phase = "starting"
+        self._active_review_run = None
+
+        def work() -> None:
+            try:
+                result = self._evolve_once(params)
+            except Exception as error:
+                results.put((False, error))
+            else:
+                results.put((True, result))
+
+        worker = threading.Thread(target=work, daemon=True, name="evolink-evolution-barrier")
+        worker.start()
+        worker.join(max(0.0, deadline - time.monotonic()))
+        if worker.is_alive() or time.monotonic() > deadline:
+            self._evolution_unusable = True
+            self._turn_evolved = False
+            phase = self._evolution_phase
+
+            def cancel() -> None:
+                try:
+                    run = self._active_review_run
+                    review_agent = run.cancel() if run is not None else None
+                    if review_agent is not None:
+                        from agent.background_review import _interrupt_background_review
+                        _interrupt_background_review(review_agent)
+                except Exception:
+                    pass
+
+            threading.Thread(target=cancel, daemon=True, name="evolink-evolution-cancel").start()
+            worker.join(self._evolution_teardown_grace)
+            raise RuntimeError(
+                f"Hermes evolution barrier timed out during {phase} after {timeout:g}s; "
+                "learning state is uncommitted and this runtime cannot continue"
+            )
+        succeeded, result = results.get_nowait()
+        if not succeeded:
+            raise result
+        return result
+
+    def _evolve_once(self, params: dict[str, Any]) -> dict[str, Any]:
+        state = self._require_turn(str(params.get("turn_id", "")))
+        if self._turn_evolved:
+            raise RuntimeError(f"Hermes turn {self._turn_id} was already evolved")
+        agent = state.agent
+        self._evolution_phase = "usage_before"
+        before_usage = self._background_review_usage(agent)
+        events: list[dict[str, Any]] = []
+
+        if not bool(params.get("update_enabled", True)):
+            events.append({
+                "type": "evolution.skipped",
+                "policy": self._policy,
+                "reason": str(params.get("skip_reason") or "run_condition"),
+            })
+        elif self._policy == "turn_boundary":
+            evolution_timeout = float(
+                self._turn_limits.get("evolution_timeout_seconds", self._review_timeout)
+            )
+            self._evolution_phase = "prepare_review"
+            focus = self._build_review_focus(params)
+            review_run, review_thread = self._spawn_turn_boundary_review(
+                agent,
+                messages_snapshot=list(state.history),
+                focus=focus,
+            )
+            self._active_review_run = review_run
+            self._evolution_phase = "review_wait"
+            # Hermes' request_done event is deliberately published as soon as
+            # the provider-capable phase returns.  The worker can still be in
+            # action summarisation or teardown at that point, and those paths
+            # may finish persistent skill writes after the next Turn starts.
+            # The benchmark's evolution barrier is stronger: no foreground
+            # interaction may begin until the whole review worker has exited.
+            review_thread.join(timeout=evolution_timeout)
+            if review_thread.is_alive():
+                self._evolution_phase = "cancel_review"
+                try:
+                    review_agent = review_run.cancel()
+                    if review_agent is not None:
+                        from agent.background_review import _interrupt_background_review
+
+                        _interrupt_background_review(review_agent)
+                except Exception:
+                    pass
+                review_run.request_done.wait(timeout=5)
+                review_thread.join(timeout=5)
+                if review_thread.is_alive():
+                    # Returning would authorize the next foreground Turn while
+                    # this writer is still live. Fail closed so the process
+                    # runtime tears down the adapter/container instead.
+                    raise RuntimeError(
+                        "Hermes background review remained live after evolution timeout"
+                    )
+                self._evolution_phase = "usage_after_cancel"
+                after_usage = self._background_review_usage(agent)
+                self._turn_evolved = True
+                return {
+                    "completed": False,
+                    "recoverable_failure": True,
+                    "events": [{
+                        "type": "evolution.limit_exhausted",
+                        "reason": "evolution_timeout",
+                        "policy": self._policy,
+                        "timeout_seconds": evolution_timeout,
+                        "review_trace": getattr(review_run, "outcome", {}),
+                    }],
+                    "usage": _subtract_usage(after_usage, before_usage),
+                }
+            review_trace = getattr(review_run, "outcome", {})
+            max_calls = self._turn_limits.get("evolution_max_model_calls")
+            review_calls = int(review_trace.get("api_calls", 0) or 0) if isinstance(review_trace, dict) else 0
+            if (isinstance(review_trace, dict) and review_trace.get("error")) or (max_calls and review_calls >= max_calls):
+                self._evolution_phase = "usage_after_limit"
+                after_usage = self._background_review_usage(agent)
+                self._turn_evolved = True
+                reason = "evolution_error" if review_trace.get("error") else "evolution_max_model_calls"
+                return {
+                    "completed": False,
+                    "recoverable_failure": True,
+                    "events": [{
+                        "type": "evolution.limit_exhausted",
+                        "reason": reason,
+                        "policy": self._policy,
+                        "work_limits": {"max_model_calls": max_calls, "timeout_seconds": evolution_timeout},
+                        "review_trace": review_trace,
+                    }],
+                    "usage": _subtract_usage(after_usage, before_usage),
+                }
+            events.append({"type": "evolution.completed", "policy": self._policy, "review_trace": review_trace})
+        elif self._policy == "native":
+            review_run = getattr(agent, "_background_review_run", None)
+            if review_run is not None and not review_run.request_done.wait(timeout=self._review_timeout):
+                raise RuntimeError(
+                    f"Hermes native background review exceeded {self._review_timeout:.0f}s"
+                )
+            events.append({"type": "evolution.quiesced", "policy": self._policy})
+        else:
+            events.append({"type": "evolution.skipped", "policy": self._policy})
+
+        self._evolution_phase = "usage_after"
+        after_usage = self._background_review_usage(agent)
+        self._turn_evolved = True
+        return {
+            "completed": True,
+            "events": events,
+            "usage": _subtract_usage(after_usage, before_usage),
+        }
+
+    @staticmethod
+    def _spawn_turn_boundary_review(
+        agent: Any,
+        *,
+        messages_snapshot: list[dict[str, Any]],
+        focus: str,
+    ) -> tuple[Any, threading.Thread]:
+        """Start one explicit review and return its exact worker handle.
+
+        Hermes' public helper intentionally returns ``None`` because ordinary
+        interactive turns never join background reviews.  L2 turn-boundary
+        evolution has a different contract, so build the same upstream target
+        through Hermes' existing primitives and retain the thread handle for
+        the barrier instead of guessing from a request-phase event.
+        """
+        from agent.background_review import (
+            finish_background_review_run,
+            prepare_background_review_run,
+            spawn_background_review_thread,
+        )
+        from tools.thread_context import propagate_context_to_thread
+
+        review_run = prepare_background_review_run(agent)
+        if review_run is None:
+            raise RuntimeError("Hermes did not create a background review run")
+        try:
+            target, _prompt = spawn_background_review_thread(
+                agent,
+                messages_snapshot,
+                review_memory=True,
+                review_skills=True,
+                focus=focus,
+                review_run=review_run,
+            )
+            worker = threading.Thread(
+                target=propagate_context_to_thread(target),
+                daemon=True,
+                name="bg-review",
+            )
+            worker.start()
+        except Exception:
+            finish_background_review_run(agent, review_run)
+            raise
+        return review_run, worker
+
+    def end_flow(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._close_current_session()
+        self._manager = None
+        self._workspace = None
+        return {"closed": True}
+
+    def _require_turn(self, turn_id: str) -> Any:
+        if self._state is None or self._turn_id is None:
+            raise RuntimeError("Hermes turn has not started")
+        if turn_id != self._turn_id:
+            raise RuntimeError(f"inactive Hermes turn: {turn_id}")
+        return self._state
+
+    def _close_current_session(self) -> None:
+        state = self._state
+        if state is None:
+            return
+        agent = state.agent
+        try:
+            agent.shutdown_memory_provider()
+        except Exception:
+            pass
+        try:
+            agent.close()
+        except Exception:
+            pass
+        if self._manager is not None:
+            try:
+                self._manager.remove_session(state.session_id)
+            except Exception:
+                pass
+        self._state = None
+        self._turn_id = None
+        self._turn_evolved = False
+        self._turn_limits = {}
+        self._limit_state = {}
+        self._l1_tools = []
+        self._is_l1_turn = False
+        self._is_taskstream_turn = False
+        self._is_l1_life_turn = False
+        self._l1_state = {}
+
+    def _install_callbacks(self, agent: Any) -> None:
+        def tool_progress(event_type: str, name: str | None = None, preview: str | None = None, args: Any = None, **kwargs: Any) -> None:
+            if event_type != "tool.started":
+                return
+            self._limit_state["tool_starts"] = int(self._limit_state.get("tool_starts", 0)) + 1
+            arguments = args if isinstance(args, dict) else {"raw": args} if args is not None else {}
+            self._events.append(
+                {
+                    "type": "tool.started",
+                    "tool": str(name or "unknown"),
+                    "arguments": _json_safe(arguments),
+                    "preview": str(preview or ""),
+                }
+            )
+            max_tools = self._turn_limits.get("max_tool_calls")
+            if max_tools is not None and self._limit_state["tool_starts"] >= max_tools:
+                self._record_limit("max_tool_calls")
+                # The current call is the last permitted one.  Hermes checks
+                # this flag before starting another model iteration, so no
+                # subsequent tool batch is accepted.
+                agent._interrupt_requested = True
+
+        def step(api_call_count: int, previous_tools: Any = None) -> None:
+            if not isinstance(previous_tools, list):
+                return
+            for item in previous_tools:
+                normalized = _normalize_tool_result(item)
+                self._tool_calls.append(normalized)
+                self._events.append({"type": "tool.completed", **normalized})
+
+        def reasoning(text: str) -> None:
+            if text:
+                self._events.append({"type": "reasoning", "text": str(text)})
+
+        def event(name: str, payload: Any) -> None:
+            self._events.append({"type": str(name), "payload": _json_safe(payload)})
+
+        agent.tool_progress_callback = tool_progress
+        agent.step_callback = step
+        agent.reasoning_callback = reasoning
+        agent.event_callback = event
+
+    @contextlib.contextmanager
+    def _foreground_policy(self, agent: Any, session_id: str, cwd: str, limits: dict[str, int]):
+        from hermes_cli.plugins import clear_thread_tool_whitelist, set_thread_tool_whitelist
+        from tools import terminal_tool, memory_tool
+
+        previous_tools = getattr(agent, "tools", None)
+        bounded_tools = _bounded_terminal_tools(previous_tools, limits)
+        previous_valid_tool_names = set(
+            getattr(agent, "valid_tool_names", set()) or set()
+        )
+        allowed = set(previous_valid_tool_names)
+        if self._policy == "turn_boundary":
+            allowed.difference_update({"memory", "skill_manage", "session_search"})
+        previous_approval = terminal_tool._get_approval_callback()
+        previous_terminal_timeout = os.environ.get("TERMINAL_TIMEOUT")
+        previous_terminal_handler = terminal_tool.terminal_tool
+        previous_memory_handler = memory_tool.memory_tool
+        local_environment = None
+        previous_run_bash = previous_temp_dir = None
+        if self._task_terminal_socket:
+            from tools.environments.local import LocalEnvironment
+            from tools.environments.base import _pipe_stdin
+            from evolink_bench.task_terminal import PUBLIC_DIRECTORY
+            local_environment = LocalEnvironment
+            previous_run_bash = LocalEnvironment._run_bash
+            previous_temp_dir = LocalEnvironment.get_temp_dir
+            terminal_socket = self._task_terminal_socket
+
+            def task_temp_dir(environment):
+                path = Path(PUBLIC_DIRECTORY) / "hermes-temp"
+                path.mkdir(exist_ok=True)
+                return str(path)
+
+            def task_bash(environment, cmd_string, *, login=False, timeout=120, stdin_data=None):
+                # Preserve Hermes' snapshot/cwd protocol and subprocess lifecycle.
+                # Both containers see the transient snapshot files in this volume.
+                proc = subprocess.Popen(
+                    [sys.executable, "/opt/evolink/evolink_bench/task_terminal.py", "shell",
+                     "--socket", terminal_socket, "--timeout", str(timeout), "-c", cmd_string],
+                    cwd=environment.cwd, text=True, encoding="utf-8", errors="replace",
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                if stdin_data is not None:
+                    _pipe_stdin(proc, stdin_data)
+                return proc
+
+        def frozen_memory(*args: Any, **kwargs: Any) -> str:
+            # Hermes routes built-in memory directly, bypassing the plugin
+            # whitelist. Guard that entrypoint too, including worker threads.
+            return json.dumps({"success": False, "error": "Persistent memory is read-only during task execution; learning is allowed only at the turn boundary."})
+
+        def approval_callback(*args: Any, **kwargs: Any) -> str:
+            return self._approval_policy
+
+        def limited_terminal(*args: Any, **kwargs: Any) -> str:
+            """Keep terminal work inside the same hard per-command budget."""
+
+            terminal_limit = limits.get("terminal_timeout_seconds")
+            if terminal_limit is None:
+                return previous_terminal_handler(*args, **kwargs)
+            if bool(kwargs.get("background", False)):
+                self._record_limit("background_terminal_forbidden")
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": 124,
+                        "error": "L2 evaluation forbids background terminal jobs; finish within the foreground command budget.",
+                        "status": "error",
+                    },
+                    ensure_ascii=False,
+                )
+            requested_timeout = kwargs.get("timeout")
+            if requested_timeout is None:
+                kwargs["timeout"] = terminal_limit
+            else:
+                try:
+                    kwargs["timeout"] = min(int(requested_timeout), terminal_limit)
+                except (TypeError, ValueError):
+                    kwargs["timeout"] = terminal_limit
+            result = previous_terminal_handler(*args, **kwargs)
+            result = _bounded_terminal_hint(result, terminal_limit)
+            if '"exit_code": 124' in str(result) or "timed out after" in str(result):
+                self._events.append({"type": "tool.timeout", "reason": "terminal_timeout", "scope": "command", "hard_command_deadline_retained": True})
+            return result
+
+        session_tokens = None
+        clear_session_vars = None
+        try:
+            if bounded_tools is not previous_tools:
+                agent.tools = bounded_tools
+            if local_environment is not None:
+                local_environment._run_bash = task_bash
+                local_environment.get_temp_dir = task_temp_dir
+            try:
+                from gateway.session_context import clear_session_vars as clear_vars
+                from gateway.session_context import set_session_vars
+
+                session_tokens = set_session_vars(
+                    session_key=session_id,
+                    session_id=session_id,
+                    cwd=cwd,
+                    cron_session="",
+                )
+                clear_session_vars = clear_vars
+            except Exception:
+                pass
+            terminal_tool.set_approval_callback(approval_callback)
+            if limits.get("terminal_timeout_seconds") is not None:
+                os.environ["TERMINAL_TIMEOUT"] = str(limits["terminal_timeout_seconds"])
+                terminal_tool.terminal_tool = limited_terminal
+            if self._policy == "turn_boundary":
+                # The plugin whitelist is thread-local and Hermes may dispatch
+                # parallel tool calls on worker threads. Remove learning-state
+                # tools from the agent schema/dispatcher as the process-wide
+                # foreground boundary, then restore them for evolve().
+                agent.valid_tool_names = allowed
+                memory_tool.memory_tool = frozen_memory
+                set_thread_tool_whitelist(
+                    allowed,
+                    deny_msg_fmt=(
+                        "EvoLink-Bench strict turn boundary denied persistent-state tool: {tool_name}. "
+                        "Learning is only allowed after the Turn."
+                    ),
+                )
+            yield
+        finally:
+            if bounded_tools is not previous_tools:
+                agent.tools = previous_tools
+            if local_environment is not None:
+                local_environment._run_bash = previous_run_bash
+                local_environment.get_temp_dir = previous_temp_dir
+            if self._policy == "turn_boundary":
+                clear_thread_tool_whitelist()
+                agent.valid_tool_names = previous_valid_tool_names
+            terminal_tool.terminal_tool = previous_terminal_handler
+            memory_tool.memory_tool = previous_memory_handler
+            if previous_terminal_timeout is None:
+                os.environ.pop("TERMINAL_TIMEOUT", None)
+            else:
+                os.environ["TERMINAL_TIMEOUT"] = previous_terminal_timeout
+            terminal_tool.set_approval_callback(previous_approval)
+            if session_tokens is not None and clear_session_vars is not None:
+                try:
+                    clear_session_vars(session_tokens)
+                except Exception:
+                    pass
+
+    def _record_limit(self, reason: str) -> None:
+        reasons = self._limit_state.setdefault("reasons", [])
+        if reason not in reasons:
+            reasons.append(reason)
+            self._events.append({"type": "work_limit.reached", "reason": reason})
+
+    def _usage_delta(self, result: dict[str, Any]) -> dict[str, Any]:
+        current: dict[str, float] = {}
+        mapping = {
+            "input_tokens": "input_tokens",
+            "output_tokens": "output_tokens",
+            "cached_read_tokens": "cache_read_tokens",
+            "cached_write_tokens": "cache_write_tokens",
+            "reasoning_tokens": "reasoning_tokens",
+            "total_tokens": "total_tokens",
+            "estimated_cost_usd": "estimated_cost_usd",
+        }
+        delta: dict[str, Any] = {}
+        for target, source in mapping.items():
+            raw = result.get(source, 0)
+            try:
+                value = float(raw or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            current[target] = value
+            difference = max(0.0, value - self._last_usage.get(target, 0.0))
+            delta[target] = difference if target == "estimated_cost_usd" else int(difference)
+        try:
+            calls = float(result.get("api_calls", 0) or 0)
+        except (TypeError, ValueError):
+            calls = 0.0
+        current["api_calls"] = calls
+        delta["api_calls"] = int(max(0.0, calls))
+        self._last_usage = current
+        return delta
+
+    def _background_review_usage(self, agent: Any) -> dict[str, Any]:
+        db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None)
+        if db is None or not session_id or not hasattr(db, "_read_ctx"):
+            return {}
+        try:
+            db.flush_token_counts()
+            with db._read_ctx() as connection:
+                row = connection.execute(
+                    """SELECT COALESCE(SUM(input_tokens), 0),
+                              COALESCE(SUM(output_tokens), 0),
+                              COALESCE(SUM(cache_read_tokens), 0),
+                              COALESCE(SUM(cache_write_tokens), 0),
+                              COALESCE(SUM(reasoning_tokens), 0),
+                              COALESCE(SUM(api_call_count), 0),
+                              COALESCE(SUM(estimated_cost_usd), 0)
+                         FROM session_model_usage
+                        WHERE session_id = ? AND task = 'background_review'""",
+                    (session_id,),
+                ).fetchone()
+            values = list(row) if row is not None else [0] * 7
+            return {
+                "input_tokens": int(values[0] or 0),
+                "output_tokens": int(values[1] or 0),
+                "cached_read_tokens": int(values[2] or 0),
+                "cached_write_tokens": int(values[3] or 0),
+                "reasoning_tokens": int(values[4] or 0),
+                "api_calls": int(values[5] or 0),
+                "estimated_cost_usd": float(values[6] or 0),
+                "total_tokens": sum(int(value or 0) for value in values[:4]),
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _build_review_focus(params: dict[str, Any]) -> str:
+        trajectory = params.get("trajectory", [])
+        feedback = params.get("feedback", [])
+        return (
+            "This is the single EvoLink-Bench Turn-boundary evolution pass. "
+            "Use only the public task trajectory and public evaluator feedback below. "
+            "Extract durable, class-level improvements; do not memorize hidden answers or one-off oracle facts.\n\n"
+            "PUBLIC TRAJECTORY:\n"
+            + json.dumps(_json_safe(trajectory), ensure_ascii=False)
+            + "\n\nPUBLIC EVALUATOR FEEDBACK:\n"
+            + json.dumps(_json_safe(feedback), ensure_ascii=False)
+        )
+
+
+
+def _terminal_budget_hint(seconds: int) -> str:
+    return (
+        f"Each foreground command has at most {seconds}s and must also fit the remaining episode budget. "
+        "Background execution is unavailable. Split long work into bounded foreground commands. "
+        "If a temporary server is needed, start it, use it, and stop it within one foreground command."
+    )
+
+
+def _bounded_terminal_tools(tools: Any, limits: dict[str, int]) -> Any:
+    seconds = limits.get("terminal_timeout_seconds")
+    if seconds is None or not isinstance(tools, list):
+        return tools
+    bounded = copy.deepcopy(tools)
+    for tool in bounded:
+        if not isinstance(tool, dict):
+            continue
+        schema = tool.get("function", tool)
+        if not isinstance(schema, dict) or schema.get("name") != "terminal":
+            continue
+        schema["description"] = (
+            "Execute shell commands in the task workspace. " + _terminal_budget_hint(seconds)
+        )
+        properties = schema.get("parameters", {}).get("properties", {})
+        if not isinstance(properties, dict):
+            continue
+        if isinstance(properties.get("timeout"), dict):
+            properties["timeout"].update({
+                "description": f"Foreground timeout in seconds; at most {seconds}s and remaining episode time.",
+                "maximum": seconds,
+            })
+        for name in ("background", "notify_on_complete", "watch_patterns"):
+            if isinstance(properties.get(name), dict):
+                properties[name]["description"] = "Unavailable during this evaluation; use foreground commands."
+    return bounded
+
+
+def _bounded_terminal_hint(result: Any, seconds: int) -> Any:
+    if not isinstance(result, str):
+        return result
+    try:
+        decoded = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(decoded, dict) or decoded.get("exit_code") != 124:
+        return result
+    # Only advisory metadata changes. Preserve command output, errors and status.
+    decoded["hint"] = _terminal_budget_hint(seconds)
+    return json.dumps(decoded, ensure_ascii=False)
+
+
+def _l1_protocol_prompt(available_tools: list[str], l1_life: bool = False) -> str:
+    tools = ", ".join(available_tools)
+    return (
+        "L1 SIMULATED-TOOL PROTOCOL: these evaluator tools are available and must not be described as missing: "
+        + tools
+        + ". In your final response, after the user-facing text, emit one line per required call exactly as "
+        "TRIEVO_TOOL_CALL: {\"tool\": \"name\", \"arguments\": {...}}. "
+        "To create or replace a sandbox file, emit TRIEVO_ACTION: {\"op\": \"write_file\", \"path\": \"/workspace/...\", \"content\": \"complete file content\"} "
+        "on its own line, in addition to the file.create_file tool call. "
+        "For durable facts emit exactly one TRIEVO_STATE_UPDATE: {\"facts\": {...}} line. "
+        "When you ask a required clarification, emit a concrete event such as "
+        "TRIEVO_EVENT: {\"event\": \"asked_for_calendar_id\"}; event names may contain only lowercase letters, digits, and underscores. "
+        "During a clarification interaction, emit no TRIEVO_TOOL_CALL and no TRIEVO_ACTION: wait for the user's reply before any dependent side effect. "
+        "Never emit an incomplete tool-call line: omit it until every required argument is known. calendar.create_event always needs calendar_id, title, start, and end. "
+        "The bridge removes these protocol lines before showing the user and the evaluator executes the calls. "
+        "Do not attempt native Hermes tool calls: only the TRIEVO protocol lines enact L1 side effects. "
+        "Keep visible replies within any requested sentence limit (otherwise at most three concise sentences), and never repeat a simulated call that succeeded earlier in the conversation. "
+        "For calendar timestamps include the requested +08:00 offset, for example 2026-08-24T10:00:00+08:00. "
+        "Benchmark task literals are authoritative: use an explicitly stated absolute date exactly; do not replace it using the host date. "
+        + (
+            "For a lasting user fact explicitly disclosed or corrected in this conversation, use its semantic key in facts and a value object, for example {\"facts\": {\"default_workspace\": {\"value\": \"docs/project/drafts\"}}}. "
+            "Never save a one-turn formatting request as a fact; when correcting a fact, keep the previous value in fact_history with status=superseded."
+            if l1_life
+            else "Use fact keys default_output_language=zh-CN or en-US, aurora.technical_owner, default_delivery_calendar_id, aurora.delivery_group_id, and aurora.go_live_date when applicable. "
+            "Each fact must be {\"value\": \"...\"}; replacing a fact must also retain its old value in fact_history with status=superseded."
+        )
+    )
+
+
+def _is_l1_metadata(metadata: Any) -> bool:
+    """Identify L1 explicitly, including read-only turns without any tools."""
+
+    return isinstance(metadata, dict) and metadata.get("source_format") in {
+        "l1_demo_task_json",
+        "l1_life_v2_task_json",
+        # L2-Demo-V2 TaskStream uses the same one-Interaction/explicit
+        # evaluator boundary as the L1 protocol adapter.  Marking it here
+        # prevents Hermes' native continuation loop from consuming the whole
+        # L2 Interaction budget before the package verifier can run.
+        "l2_taskstream_task_json",
+        "l1_arena_task_json",
+    }
+
+
+def _is_taskstream_metadata(metadata: Any) -> bool:
+    return isinstance(metadata, dict) and metadata.get("source_format") in {
+        "l2_taskstream_task_json",
+        "l1_arena_task_json",
+    }
+
+
+def _is_l1_life_metadata(metadata: Any) -> bool:
+    return isinstance(metadata, dict) and metadata.get("source_format") == "l1_life_v2_task_json"
+
+
+def _l1_readonly_workspace_context(workspace: Path) -> str:
+    """Give protocol-only L1 agents safe access to benchmark source material.
+
+    L1 side effects are evaluator-owned, so native terminal/file tools stay
+    disabled.  File analysis, editing, and translation tasks nevertheless need
+    their source text; provide a bounded immutable snapshot rather than
+    reopening native workspace tools.
+    """
+
+    allowed_roots = {"docs", "data"}
+    excluded_names = {"__pycache__", ".git", "state", "iterations"}
+    total_limit = 48_000
+    per_file_limit = 16_000
+    remaining = total_limit
+    parts: list[str] = []
+    try:
+        candidates = sorted(workspace.rglob("*"))
+    except OSError:
+        return ""
+    for path in candidates:
+        if remaining <= 0 or not path.is_file():
+            continue
+        try:
+            relative = path.relative_to(workspace)
+        except ValueError:
+            continue
+        if not relative.parts or relative.parts[0] not in allowed_roots:
+            continue
+        if any(part in excluded_names for part in relative.parts):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        excerpt = content[: min(per_file_limit, remaining)]
+        parts.append(f"FILE /workspace/{relative.as_posix()} (read-only):\n{excerpt}")
+        remaining -= len(excerpt)
+    if not parts:
+        return ""
+    return (
+        "\n\nREAD-ONLY SANDBOX CONTEXT: the following files are authoritative "
+        "source material. Do not claim you cannot read them. Do not use native "
+        "tools or modify them directly; required side effects still use only the "
+        "TRIEVO protocol lines.\n\n"
+        + "\n\n".join(parts)
+    )
+
+
+def _l1_persistent_state_context(state: dict[str, Any]) -> str:
+    if not state:
+        return ""
+    return "\n\nPERSISTENT L1 FACTS: use these already-established facts rather than guessing.\n" + json.dumps(state, ensure_ascii=False)
+
+
+def _merge_l1_state(current: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for key, value in update.items():
+        if key == "facts" and isinstance(value, dict):
+            facts = dict(merged.get("facts", {})) if isinstance(merged.get("facts"), dict) else {}
+            facts.update(value)
+            merged["facts"] = facts
+        elif key == "fact_history" and isinstance(value, list):
+            history = list(merged.get("fact_history", [])) if isinstance(merged.get("fact_history"), list) else []
+            merged["fact_history"] = history + value
+        else:
+            merged[key] = value
+    return merged
+
+
+def _extract_l1_protocol(
+    text: str, available_tools: list[str]
+) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    visible: list[str] = []
+    state_update: dict[str, Any] = {}
+    calls: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if line.startswith("TRIEVO_STATE_UPDATE:"):
+            try:
+                value = json.loads(line.split(":", 1)[1].strip())
+                if isinstance(value, dict):
+                    state_update = value
+            except json.JSONDecodeError:
+                pass
+            continue
+        if line.startswith("TRIEVO_EVENT:"):
+            try:
+                value = json.loads(line.split(":", 1)[1].strip())
+                if isinstance(value, dict) and isinstance(value.get("event"), str):
+                    events.append(value)
+            except json.JSONDecodeError:
+                pass
+            continue
+        if line.startswith("TRIEVO_ACTION:"):
+            try:
+                value = json.loads(line.split(":", 1)[1].strip())
+                if (
+                    isinstance(value, dict)
+                    and value.get("op") == "write_file"
+                    and isinstance(value.get("path"), str)
+                    and isinstance(value.get("content"), str)
+                ):
+                    actions.append({"op": "write_file", "path": value["path"], "content": value["content"]})
+            except json.JSONDecodeError:
+                pass
+            continue
+        if line.startswith("TRIEVO_TOOL_CALL:"):
+            try:
+                value = json.loads(line.split(":", 1)[1].strip())
+                if isinstance(value, dict) and str(value.get("tool")) in available_tools and isinstance(value.get("arguments"), dict):
+                    calls.append({"tool": str(value["tool"]), "arguments": value["arguments"]})
+            except json.JSONDecodeError:
+                pass
+            continue
+        visible.append(line)
+    facts = state_update.get("facts") if isinstance(state_update.get("facts"), dict) else None
+    if facts is not None:
+        aliases = {
+            "default_work_language": ("default_output_language", "zh-CN"),
+            "aurora_tech_lead": ("aurora.technical_owner", None),
+            "delivery_calendar_id": ("default_delivery_calendar_id", None),
+        }
+        normalized = dict(facts)
+        for source, (target, fixed_value) in aliases.items():
+            if source in normalized and target not in normalized:
+                normalized[target] = fixed_value if fixed_value is not None else normalized[source]
+        state_update["facts"] = normalized
+    return "\n".join(visible).strip(), state_update, calls, events, actions
+
+
+def _complete_l1_file_actions(
+    calls: list[dict[str, Any]], actions: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Preserve legacy file.create_file content as an auditable sandbox write.
+
+    Some Hermes replies already carry the complete file body in the simulated
+    file.create_file arguments.  That is sufficient intent to create the
+    evaluator-owned file, but Runner needs an explicit write_file action to
+    materialize it.  Normalise it here without opening native file tools.
+    """
+
+    completed = list(actions)
+    written = {str(action.get("path")) for action in completed if action.get("op") == "write_file"}
+    for call in calls:
+        if call.get("tool") != "file.create_file":
+            continue
+        arguments = call.get("arguments", {})
+        if not isinstance(arguments, dict):
+            continue
+        path = arguments.get("path") or arguments.get("filename")
+        content = arguments.get("content")
+        if isinstance(path, str) and isinstance(content, str) and path not in written:
+            completed.append({"op": "write_file", "path": path, "content": content})
+            written.add(path)
+    return completed
+
+
+def _normalize_tool_result(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        name = item.get("name") or item.get("function_name") or item.get("tool") or "unknown"
+        arguments = item.get("arguments", item.get("args", {}))
+        result = item.get("result", item.get("output"))
+        return {
+            "tool": str(name),
+            "arguments": _json_safe(arguments if isinstance(arguments, dict) else {"raw": arguments}),
+            "result": _json_safe(result),
+        }
+    return {"tool": str(item), "arguments": {}, "result": None}
+
+
+def _parse_l2_agent_limits(metadata: Any) -> dict[str, int]:
+    """Validate the shared bounded-autonomy contract (with L2 legacy support)."""
+
+    if not isinstance(metadata, dict):
+        return {}
+    raw = metadata.get("agent_limits", metadata.get("l2_agent_limits"))
+    if not isinstance(raw, dict):
+        return {}
+    from evolink_bench.task_terminal import SCHEMA
+    task_terminal = (metadata.get("task_sandbox") or {}).get("terminal_transport") == SCHEMA
+    fields = {
+        "max_model_calls": (2, 100),
+        "max_tool_calls": (1, 100),
+        "terminal_timeout_seconds": (1, 3600 if task_terminal else 600),
+        "episode_timeout_seconds": (30, 86400 if metadata.get("slow_provider") is True else 3600),
+        "evolution_max_model_calls": (1, 16),
+        "evolution_timeout_seconds": (10, 86400 if metadata.get("slow_provider") is True else 900),
+    }
+    result: dict[str, int] = {}
+    for name, (minimum, maximum) in fields.items():
+        value = raw.get(name)
+        if isinstance(value, bool):
+            raise RuntimeError(f"agent_limits.{name} must be an integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"agent_limits.{name} must be an integer") from exc
+        if not minimum <= parsed <= maximum:
+            raise RuntimeError(
+                f"agent_limits.{name} must be between {minimum} and {maximum}"
+            )
+        result[name] = parsed
+    if "max_output_tokens" in raw:
+        value = raw["max_output_tokens"]
+        if isinstance(value, bool):
+            raise RuntimeError("agent_limits.max_output_tokens must be an integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("agent_limits.max_output_tokens must be an integer") from exc
+        if not 1 <= parsed <= 1_000_000:
+            raise RuntimeError(
+                "agent_limits.max_output_tokens must be between 1 and 1000000"
+            )
+        result["max_output_tokens"] = parsed
+    return result
+
+
+def _subtract_usage(after: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in {
+        "input_tokens",
+        "output_tokens",
+        "cached_read_tokens",
+        "cached_write_tokens",
+        "reasoning_tokens",
+        "api_calls",
+        "total_tokens",
+        "estimated_cost_usd",
+    }:
+        try:
+            value = max(0.0, float(after.get(key, 0) or 0) - float(before.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            value = 0.0
+        result[key] = value if key == "estimated_cost_usd" else int(value)
+    return result
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return repr(value)
+
+
+def main() -> None:
+    protocol_stdout = sys.stdout
+    bridge = HermesBridge()
+    for line in sys.stdin:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        request_id: Any = None
+        method = ""
+        try:
+            request = json.loads(stripped)
+            if not isinstance(request, dict):
+                raise RuntimeError("protocol request must be an object")
+            request_id = request.get("id")
+            method = str(request.get("method", ""))
+            params = request.get("params", {})
+            if not isinstance(params, dict):
+                raise RuntimeError("protocol params must be an object")
+            with contextlib.redirect_stdout(sys.stderr):
+                result = bridge.dispatch(method, params)
+            response = {"id": request_id, "result": _json_safe(result)}
+        except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
+            response = {"id": request_id, "error": {"message": str(exc)}}
+        protocol_stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+        protocol_stdout.flush()
+        if method == "end_flow":
+            break
+
+
+
+
+def _install_slow_provider_policy(agent_class):
+    # Background review constructs a fresh AIAgent. Cover that constructor as
+    # well as foreground sessions; scoped to this isolated adapter process.
+    original = agent_class.__init__
+    if getattr(original, "_trievo_slow_provider", False):
+        return
+
+    @functools.wraps(original)
+    def initialize(agent, *args, **kwargs):
+        original(agent, *args, **kwargs)
+        _configure_slow_provider_agent(agent)
+
+    initialize._trievo_slow_provider = True
+    agent_class.__init__ = initialize
+
+
+def _configure_slow_provider_agent(agent):
+    """Apply transport policy without editing resumed, frozen learning state."""
+    timeout = int(os.environ.get("TRIEVO_API_TIMEOUT_SECONDS", "600"))
+    retries = int(os.environ.get("TRIEVO_API_MAX_RETRIES", "20"))
+    if not 1 <= timeout <= 3600 or not 0 <= retries <= 100:
+        raise RuntimeError("invalid slow-provider request policy")
+    agent._api_max_retries = retries + 1  # Hermes counts total attempts.
+    agent._resolved_api_call_timeout = lambda: float(timeout)
+    agent._resolved_api_call_stale_timeout_base = lambda: (float(timeout), False)
+    client = getattr(agent, "client", None)
+    if client is not None and hasattr(client, "max_retries"):
+        client.max_retries = 0
+
+
+if __name__ == "__main__":
+    main()

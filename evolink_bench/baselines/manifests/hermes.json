@@ -1,0 +1,147 @@
+{
+  "schema_version": "1.0",
+  "id": "hermes",
+  "adapter": {
+    "type": "process",
+    "timeout_seconds": 1800,
+    "cwd": "{repo_root}",
+    "command": [
+      "docker",
+      "run",
+      "--rm",
+      "-i",
+      "--name",
+      "evolink-hermes-{instance_id}",
+      "--user",
+      "{uid}:{gid}",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--pids-limit",
+      "512",
+      "--memory",
+      "8g",
+      "--cpus",
+      "4",
+      "-v",
+      "{workspace_mount}:/workspace",
+      "-v",
+      "{state_mount}:/hermes-state",
+      "-e",
+      "HERMES_HOME=/hermes-state",
+      "-e",
+      "HOME=/hermes-state/home",
+      "-e",
+      "OPENAI_API_KEY",
+      "-e",
+      "OPENROUTER_API_KEY",
+      "-e",
+      "ANTHROPIC_API_KEY",
+      "-e",
+      "DEEPSEEK_API_KEY",
+      "-e",
+      "DEEPSEEK_BASE_URL",
+      "-e",
+      "HTTP_PROXY",
+      "-e",
+      "HTTPS_PROXY",
+      "-e",
+      "NO_PROXY",
+      "-e",
+      "http_proxy",
+      "-e",
+      "https_proxy",
+      "-e",
+      "no_proxy",
+      "-e",
+      "GEMINI_API_KEY",
+      "-e",
+      "GOOGLE_API_KEY",
+      "-e",
+      "XAI_API_KEY",
+      "-e",
+      "NOUS_API_KEY",
+      "-e",
+      "GLM_API_KEY",
+      "-e",
+      "ZAI_API_KEY",
+      "-e",
+      "Z_AI_API_KEY",
+      "-e",
+      "GLM_BASE_URL",
+      "{image}"
+    ],
+    "cleanup_command": [
+      "docker",
+      "rm",
+      "-f",
+      "evolink-hermes-{instance_id}"
+    ]
+  },
+  "source": {
+    "path": "baseline/hermes-agent",
+    "revision": "53873bfae5dfdd5f1af5cb6203a441f6e75330c1"
+  },
+  "environment": {
+    "inherit": [
+      "OPENAI_API_KEY",
+      "OPENROUTER_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "DEEPSEEK_API_KEY",
+      "DEEPSEEK_BASE_URL",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "NO_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "no_proxy",
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "XAI_API_KEY",
+      "NOUS_API_KEY",
+      "GLM_API_KEY",
+      "ZAI_API_KEY",
+      "Z_AI_API_KEY",
+      "GLM_BASE_URL"
+    ]
+  },
+  "workspace": {
+    "mode": "shared_volume",
+    "adapter_path": "/workspace"
+  },
+  "state": {
+    "scope": "flow",
+    "adapter_path": "/hermes-state",
+    "paths": [
+      "memories/MEMORY.md",
+      "memories/USER.md",
+      "skills/**/*"
+    ],
+    "ignore_paths": [
+      "skills/.usage.json",
+      "skills/.usage.json.lock"
+    ],
+    "guard_paths": ["config.yaml"],
+    "seed_files": ["config.yaml"],
+    "enforce_turn_freeze": true
+  },
+  "evolution": {
+    "policy": "turn_boundary",
+    "timeout_seconds": 900
+  },
+  "options": {
+    "image": "evolink-hermes:0.1",
+    "approval_policy": "session",
+    "allow_revision_mismatch": false
+  },
+  "capabilities": [
+    "direct_workspace",
+    "terminal",
+    "memory",
+    "skills",
+    "events",
+    "usage",
+    "evolution_barrier"
+  ]
+}

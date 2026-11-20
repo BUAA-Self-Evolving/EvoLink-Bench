@@ -1,0 +1,16 @@
+FROM evolink-zcode:dependencies
+COPY baseline/adapters/zcode/install_runtime_hooks.py /opt/evolink/install-zcode-hooks.py
+RUN python3 /opt/evolink/install-zcode-hooks.py /opt/zcode
+ENV NODE_OPTIONS=--max-old-space-size=6144
+COPY baseline/adapters/zcode/build_native.py /opt/evolink/build-zcode.py
+RUN python3 /opt/evolink/build-zcode.py
+WORKDIR /opt/evolink
+COPY baseline/adapters/native_runtime.py baseline/adapters/native_runtime.py
+COPY baseline/adapters/native_budget.py baseline/adapters/native_budget.py
+COPY baseline/adapters/zcode/ baseline/adapters/zcode/
+COPY evolink_bench/task_terminal.py evolink_bench/task_terminal.py
+COPY baseline/adapters/task_shell.py /opt/evolink/task-shell
+RUN chmod 755 /opt/evolink/task-shell && mkdir -p /opt/evolink/task-bin \
+    && ln -s /opt/evolink/task-shell /opt/evolink/task-bin/bash
+ENV PYTHONPATH=/opt/evolink
+ENTRYPOINT ["python3", "-m", "baseline.adapters.zcode.bridge"]
