@@ -6,6 +6,10 @@
 
 ## Overview
 
+![An evidence-grading case at left and a house-price regression case at right flank the EvoLink-Bench protocol. The center shows the agent, workspace and verifier within a turn and the three persistence conditions across turns.](assets/evolink-overview.png)
+
+*Figure 1. An amended evidence-grading rule links disclosure to delayed recall in L1. In L2, a house-price model consumes feature tables prepared in an earlier turn, and a later text-entailment task probes transfer. The center shows the retry loop and the state retained under each persistence condition. Counts describe the constructed streams. The examples omit intervening turns.*
+
 EvoLink-Bench evaluates whether an agent can retain, correct, and reuse information and execution experience across ordered task streams. Later tasks may depend on facts, decisions, files, code, or experimental results from earlier tasks.
 
 The benchmark separates ordinary task execution and within-task retries from explicit post-turn updates. It records task outcomes together with evidence about attempted updates, committed state changes, and later transfer. Reset, Frozen, and Evolving conditions expose different persistence and update settings. Score differences between conditions are descriptive comparisons and do not by themselves establish a causal learning effect.
