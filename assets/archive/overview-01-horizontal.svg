@@ -1,0 +1,203 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1090" height="675" viewBox="0 0 1090 675" role="img" aria-labelledby="title desc">
+<title id="title">EvoLink-Bench overview</title><desc id="desc">Two task streams illustrate factual revision and reuse of a prepared feature table. Each turn permits bounded retries. Reset, Frozen and Evolving control state persistence and explicit post-turn updates. The evaluator measures task reward, retry recovery, state changes and later probe performance.</desc>
+<rect x="0" y="0" width="1090" height="675" rx="0" fill="#fff" stroke="none" stroke-width="1.8"/>
+<g id="figure-heading">
+<text x="27" y="54" fill="#192F3C" font-family="Georgia" font-size="47" font-weight="700" text-anchor="start">EvoLink-Bench</text>
+<text x="432" y="36" fill="#4D6170" font-family="Georgia" font-size="22" font-weight="400" text-anchor="start">Evaluating self-evolving agents in</text>
+<text x="432" y="62" fill="#4D6170" font-family="Georgia" font-size="22" font-weight="400" text-anchor="start">long-horizon interdependent task streams</text>
+</g>
+<g id="domains">
+<text x="913" y="23" fill="#4D6170" font-family="Georgia" font-size="16" font-weight="400" text-anchor="start">Office work</text>
+<text x="913" y="45" fill="#4D6170" font-family="Georgia" font-size="16" font-weight="400" text-anchor="start">Multi-turn dialogue</text>
+<text x="913" y="67" fill="#4D6170" font-family="Georgia" font-size="16" font-weight="400" text-anchor="start">AutoResearch</text>
+<rect x="890" y="13" width="15" height="10" rx="1.5" fill="none" stroke="#4D6170" stroke-width="1.5"/>
+<path d="M894 13 v-3 h7 v3 M890 17 q8 4 15 0" fill="none" stroke="#4D6170" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M890 34 h15 v9 h-7 l-4 4 v-4 h-4 Z" fill="none" stroke="#4D6170" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M895 55 h6 M896 56 v4 l-5 7 q-1 2 1 2 h12 q2 0 1 -2 l-5 -7 v-4 M895 64 h6" fill="none" stroke="#4D6170" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+<text x="27" y="110" fill="#286A59" font-family="Georgia" font-size="23" font-weight="400" text-anchor="start" font-style="italic">(a)</text>
+<text x="68" y="110" fill="#192F3C" font-family="Georgia" font-size="24" font-weight="700" text-anchor="start">Interdependent task streams</text>
+<rect x="18" y="126" width="1054" height="135" rx="9" fill="#EEF6F0" stroke="none" stroke-width="1.8"/>
+<rect x="18" y="270" width="1054" height="135" rx="9" fill="#EDF3F8" stroke="none" stroke-width="1.8"/>
+<g id="l1-factual-evolution">
+<text x="35" y="159" fill="#286A59" font-family="Georgia" font-size="23" font-weight="700" text-anchor="start">L1</text>
+<text x="35" y="193" fill="#192F3C" font-family="Georgia" font-size="20" font-weight="700" text-anchor="start">Factual evolution</text>
+<text x="35" y="222" fill="#286A59" font-family="Georgia" font-size="16.6" font-weight="400" text-anchor="start">23 streams · 637 turns</text>
+<g transform="translate(267,141)">
+<g transform="rotate(-6 40 30)">
+<path d="M12 6 H60 L70 16 V49 H12 Z" fill="#D5EBDE" stroke="#286A59" stroke-width="2.35" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M60 6 v10 h10" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+<path d="M19 5 H70 L80 15 V51 H19 Z" fill="white" stroke="#286A59" stroke-width="2.35" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M70 5 v10 h10" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M28 17 h19" fill="none" stroke="#286A59" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M28 25 h29" fill="none" stroke="#286A59" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M28 33 h22" fill="none" stroke="#286A59" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<g transform="rotate(-8 70 43)">
+<rect x="53" y="35" width="37" height="16" rx="2" fill="#D5EBDE" stroke="#286A59" stroke-width="1.9"/>
+<path d="M60 43 l3 3 5 -6 M73 43 h10" fill="none" stroke="#286A59" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+</g>
+<g transform="translate(492,141)">
+<g transform="rotate(-6 40 30)">
+<path d="M12 6 H60 L70 16 V49 H12 Z" fill="#D5EBDE" stroke="#286A59" stroke-width="2.35" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M60 6 v10 h10" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+<path d="M19 5 H70 L80 15 V51 H19 Z" fill="white" stroke="#286A59" stroke-width="2.35" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M70 5 v10 h10" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M28 17 h19" fill="none" stroke="#286A59" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M28 25 h29" fill="none" stroke="#286A59" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M28 33 h22" fill="none" stroke="#286A59" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M55 47 L59 35 L83 11 L90 18 L66 42 Z" fill="#F8E8BD" stroke="#99601F" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M59 35 l7 7 M80 14 l7 7 M55 47 l4 -2" fill="none" stroke="#99601F" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+<g transform="translate(707,141)">
+<path d="M15 10 Q15 6 20 6 H64 Q69 6 69 11 V32 Q69 37 64 37 H36 L25 44 V37 H20 Q15 37 15 32 Z" fill="#E3E9EC" stroke="#4D6170" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M38 21 Q38 16 43 16 H76 Q81 16 81 21 V41 Q81 46 76 46 H69 V52 L59 46 H43 Q38 46 38 41 Z" fill="#fff" stroke="#4D6170" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="48" cy="31" r="1.8" fill="#4D6170" stroke="none" stroke-width="1.7"/>
+<circle cx="59" cy="31" r="1.8" fill="#4D6170" stroke="none" stroke-width="1.7"/>
+<circle cx="70" cy="31" r="1.8" fill="#4D6170" stroke="none" stroke-width="1.7"/>
+</g>
+<g transform="translate(917,141)">
+<path d="M13 7 H48 L58 17 V51 H13 Z" fill="#D5EBDE" stroke="#286A59" stroke-width="2.35" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M48 7 v10 h10" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M20 18 h20" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M20 25 h15" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M20 32 h20" fill="none" stroke="#286A59" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="63" cy="30" r="17" fill="#fff" stroke="#286A59" stroke-width="2.5"/>
+<path d="M55 30 l5 5 11 -12" fill="none" stroke="#286A59" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M76 44 l10 10" fill="none" stroke="#286A59" stroke-width="4.4" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+<path d="M371 169 H474" fill="none" stroke="#71A18F" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M470 165 L477 169 L470 173" fill="none" stroke="#71A18F" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M601 169 H696" fill="none" stroke="#71A18F" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M692 165 L699 169 L692 173" fill="none" stroke="#71A18F" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M806 169 H899" fill="none" stroke="#71A18F" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M895 165 L902 169 L895 173" fill="none" stroke="#71A18F" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="316" y="220" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Disclose a rule</text>
+<text x="316" y="244" fill="#286A59" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">Advisory → probable</text>
+<text x="541" y="220" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Amend the rule</text>
+<text x="541" y="244" fill="#286A59" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">Static analysis → probable</text>
+<text x="753" y="220" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Other requests</text>
+<text x="753" y="244" fill="#4D6170" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">Unrelated dialogue</text>
+<text x="963" y="220" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Recall after a delay</text>
+<text x="963" y="244" fill="#286A59" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">Use the amended rule</text>
+</g>
+<g id="l2-capability-evolution">
+<text x="35" y="304" fill="#355F84" font-family="Georgia" font-size="23" font-weight="700" text-anchor="start">L2</text>
+<text x="35" y="334" fill="#192F3C" font-family="Georgia" font-size="19.5" font-weight="700" text-anchor="start">Task-level capability</text>
+<text x="35" y="357" fill="#192F3C" font-family="Georgia" font-size="19.5" font-weight="700" text-anchor="start">evolution</text>
+<text x="35" y="386" fill="#355F84" font-family="Georgia" font-size="16.6" font-weight="400" text-anchor="start">18 streams · 252 turns</text>
+<g transform="translate(271,282)">
+<g transform="rotate(-6 40 32)">
+<rect x="11" y="7" width="57" height="42" rx="2" fill="#DCE9F4" stroke="#355F84" stroke-width="2.1"/>
+</g>
+<rect x="18" y="10" width="65" height="43" rx="2" fill="white" stroke="#355F84" stroke-width="2.3"/>
+<rect x="20" y="12" width="61" height="9" rx="0" fill="#DCE9F4" stroke="none" stroke-width="1.8"/>
+<path d="M38 21 V52" fill="none" stroke="#355F84" stroke-width="1.45" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M56 21 V52" fill="none" stroke="#355F84" stroke-width="1.45" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M19 21 H82" fill="none" stroke="#355F84" stroke-width="1.45" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M19 31 H82" fill="none" stroke="#355F84" stroke-width="1.45" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M19 42 H82" fill="none" stroke="#355F84" stroke-width="1.45" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M22 27 h9" fill="none" stroke="#355F84" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M43 36 h9" fill="none" stroke="#355F84" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M63 47 h9" fill="none" stroke="#355F84" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+<g transform="translate(494,282)">
+<path d="M11 26 L32 8 L53 26 M16 23 V48 H48 V23" fill="#DCE9F4" stroke="#355F84" stroke-width="2.3" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="23" y="30" width="10" height="15" rx="0" fill="white" stroke="#355F84" stroke-width="1.8"/>
+<rect x="36" y="28" width="7" height="7" rx="0" fill="white" stroke="#355F84" stroke-width="1.4"/>
+<rect x="42" y="19" width="43" height="33" rx="2" fill="white" stroke="#355F84" stroke-width="2"/>
+<path d="M48 24 v22 h31 M50 40 L76 26" fill="none" stroke="#355F84" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="53" cy="36" r="1.85" fill="#355F84" stroke="none" stroke-width="1.7"/>
+<circle cx="58" cy="39" r="1.85" fill="#355F84" stroke="none" stroke-width="1.7"/>
+<circle cx="62" cy="30" r="1.85" fill="#355F84" stroke="none" stroke-width="1.7"/>
+<circle cx="69" cy="32" r="1.85" fill="#355F84" stroke="none" stroke-width="1.7"/>
+<circle cx="75" cy="24" r="1.85" fill="#355F84" stroke="none" stroke-width="1.7"/>
+</g>
+<g transform="translate(707,282)">
+<path d="M12 15 h25 l5 6 h36 v28 h-66 Z" fill="#E3E9EC" stroke="#4D6170" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M24 6 H50 L60 16 V35 H24 Z" fill="#fff" stroke="#4D6170" stroke-width="2.35" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M50 6 v10 h10" fill="none" stroke="#4D6170" stroke-width="1.65" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M29 16 h17 M29 22 h21" fill="none" stroke="#4D6170" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M12 23 h65 q4 0 3 4 l-5 24 h-64 Z" fill="#E8EEF1" stroke="#4D6170" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M21 32 h20" fill="none" stroke="#4D6170" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+</g>
+<g transform="translate(918,282)">
+<rect x="16" y="8" width="49" height="45" rx="3" fill="#DCE9F4" stroke="#355F84" stroke-width="2.2"/>
+<rect x="27" y="4" width="27" height="8" rx="2" fill="white" stroke="#355F84" stroke-width="1.9"/>
+<path d="M24 21 h25 M24 28 h18 M24 35 h15" fill="none" stroke="#355F84" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="64" cy="32" r="14" fill="white" stroke="#355F84" stroke-width="2.4"/>
+<path d="M74 43 l11 10" fill="none" stroke="#355F84" stroke-width="4.4" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="64" y="38" fill="#355F84" font-family="Georgia" font-size="19" font-weight="700" text-anchor="middle">?</text>
+</g>
+<path d="M371 313 H474" fill="none" stroke="#7A9AB3" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M470 309 L477 313 L470 317" fill="none" stroke="#7A9AB3" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M601 313 H696" fill="none" stroke="#7A9AB3" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M692 309 L699 313 L692 317" fill="none" stroke="#7A9AB3" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M806 313 H899" fill="none" stroke="#7A9AB3" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M895 309 L902 313 L895 317" fill="none" stroke="#7A9AB3" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="422" y="304" fill="#355F84" font-family="Courier New" font-size="15.7" font-weight="400" text-anchor="middle">features/</text>
+<text x="316" y="360" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Build feature tables</text>
+<text x="316" y="384" fill="#355F84" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">Prepare housing data</text>
+<text x="541" y="360" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Fit a price model</text>
+<text x="541" y="384" fill="#355F84" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">Reuse the feature tables</text>
+<text x="753" y="360" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Intervening tasks</text>
+<text x="753" y="384" fill="#4D6170" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">Other capabilities</text>
+<text x="963" y="360" fill="#192F3C" font-family="Georgia" font-size="18.7" font-weight="700" text-anchor="middle">Unseen probe</text>
+<text x="963" y="384" fill="#355F84" font-family="Georgia" font-size="16.8" font-weight="400" text-anchor="middle">SICK text entailment</text>
+</g>
+<g id="execution-and-update">
+<text x="27" y="449" fill="#286A59" font-family="Georgia" font-size="23" font-weight="400" text-anchor="start" font-style="italic">(b)</text>
+<text x="68" y="449" fill="#192F3C" font-family="Georgia" font-size="24" font-weight="700" text-anchor="start">From one turn to the next</text>
+<rect x="35" y="503" width="101" height="36" rx="6" fill="#F4F6F7" stroke="#192F3C" stroke-width="1.8"/>
+<text x="85.5" y="527" fill="#192F3C" font-family="Georgia" font-size="19.5" font-weight="400" text-anchor="middle">Submit</text>
+<rect x="198" y="503" width="102" height="36" rx="6" fill="#F4F6F7" stroke="#192F3C" stroke-width="1.8"/>
+<text x="249.0" y="527" fill="#192F3C" font-family="Georgia" font-size="19.5" font-weight="400" text-anchor="middle">Grade</text>
+<rect x="399" y="503" width="122" height="36" rx="6" fill="#F4F6F7" stroke="#192F3C" stroke-width="1.8"/>
+<text x="460.0" y="527" fill="#192F3C" font-family="Georgia" font-size="19.5" font-weight="400" text-anchor="middle">Next turn</text>
+<path d="M139 521 H189" fill="none" stroke="#192F3C" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M185 517 L192 521 L185 525" fill="none" stroke="#192F3C" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M304 521 H390" fill="none" stroke="#192F3C" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M386 517 L393 521 L386 525" fill="none" stroke="#192F3C" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M250 500 V487 Q250 478 240 478 H94 Q85 478 85 487 V497" fill="none" stroke="#4D6170" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M81 492 L85 498 L89 492" fill="none" stroke="#4D6170" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="93" y="465" width="148" height="19" rx="0" fill="white" stroke="none" stroke-width="1.8"/>
+<text x="167" y="480" fill="#4D6170" font-family="Comic Sans MS" font-size="16.7" font-weight="400" text-anchor="middle">Retry on feedback</text>
+<path d="M249 542 V563 Q249 572 260 572 H284" fill="none" stroke="#99601F" stroke-width="1.9" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5 4"/>
+<rect x="283" y="553" width="136" height="36" rx="5" fill="#FBF1D8" stroke="#99601F" stroke-width="1.7"/>
+<text x="351" y="577" fill="#99601F" font-family="Georgia" font-size="18.5" font-weight="400" text-anchor="middle">Update state</text>
+<path d="M422 571 H450 Q460 571 460 562 V544" fill="none" stroke="#99601F" stroke-width="1.9" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5 4"/>
+<path d="M456 549 L460 543 L464 549" fill="none" stroke="#99601F" stroke-width="1.9" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="35" y="613" fill="#4D6170" font-family="Georgia" font-size="17" font-weight="400" text-anchor="start">Retries are bounded. The last submission sets the reward.</text>
+</g>
+<g id="persistence-conditions">
+<text x="562" y="449" fill="#286A59" font-family="Georgia" font-size="23" font-weight="400" text-anchor="start" font-style="italic">(c)</text>
+<text x="603" y="449" fill="#192F3C" font-family="Georgia" font-size="24" font-weight="700" text-anchor="start">Persistence conditions</text>
+<text x="573" y="483" fill="#4D6170" font-family="Georgia" font-size="16.8" font-weight="700" text-anchor="start">Condition</text>
+<text x="722" y="483" fill="#4D6170" font-family="Georgia" font-size="16.8" font-weight="700" text-anchor="start">Workspace &amp; state</text>
+<text x="916" y="483" fill="#4D6170" font-family="Georgia" font-size="16.8" font-weight="700" text-anchor="start">Post-turn update</text>
+<text x="573" y="514" fill="#192F3C" font-family="Georgia" font-size="18.8" font-weight="700" text-anchor="start">Reset</text>
+<text x="722" y="514" fill="#192F3C" font-family="Georgia" font-size="18.4" font-weight="400" text-anchor="start">Reinitialize</text>
+<text x="916" y="514" fill="#4D6170" font-family="Georgia" font-size="18.4" font-weight="400" text-anchor="start">Off</text>
+<text x="573" y="549" fill="#192F3C" font-family="Georgia" font-size="18.8" font-weight="700" text-anchor="start">Frozen</text>
+<text x="722" y="549" fill="#192F3C" font-family="Georgia" font-size="18.4" font-weight="400" text-anchor="start">Retain</text>
+<text x="916" y="549" fill="#4D6170" font-family="Georgia" font-size="18.4" font-weight="400" text-anchor="start">Off</text>
+<rect x="562" y="561" width="510" height="33" rx="4" fill="#FBF2DE" stroke="none" stroke-width="1.8"/>
+<text x="573" y="584" fill="#192F3C" font-family="Georgia" font-size="18.8" font-weight="700" text-anchor="start">Evolving</text>
+<text x="722" y="584" fill="#192F3C" font-family="Georgia" font-size="18.4" font-weight="400" text-anchor="start">Retain</text>
+<text x="916" y="584" fill="#99601F" font-family="Georgia" font-size="18.4" font-weight="400" text-anchor="start">If supported</text>
+</g>
+<g id="readouts">
+<rect x="18" y="629" width="1054" height="35" rx="5" fill="#F1F4F4" stroke="none" stroke-width="1.8"/>
+<text x="35" y="652" fill="#192F3C" font-family="Georgia" font-size="17" font-weight="700" text-anchor="start">Readouts</text>
+<circle cx="154" cy="646" r="2.7" fill="#4D6170" stroke="none" stroke-width="1.7"/>
+<text x="165" y="652" fill="#192F3C" font-family="Georgia" font-size="17.4" font-weight="400" text-anchor="start">Final turn reward</text>
+<circle cx="384" cy="646" r="2.7" fill="#4D6170" stroke="none" stroke-width="1.7"/>
+<text x="395" y="652" fill="#192F3C" font-family="Georgia" font-size="17.4" font-weight="400" text-anchor="start">Retry recovery</text>
+<circle cx="591" cy="646" r="2.7" fill="#4D6170" stroke="none" stroke-width="1.7"/>
+<text x="602" y="652" fill="#192F3C" font-family="Georgia" font-size="17.4" font-weight="400" text-anchor="start">State changes</text>
+<circle cx="805" cy="646" r="2.7" fill="#4D6170" stroke="none" stroke-width="1.7"/>
+<text x="816" y="652" fill="#192F3C" font-family="Georgia" font-size="17.4" font-weight="400" text-anchor="start">Unseen-probe score</text>
+</g>
+</svg>
