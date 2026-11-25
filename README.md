@@ -4,6 +4,8 @@
 
 [GitHub repository](https://github.com/BUAA-Self-Evolving/EvoLink-Bench) · [中文说明](docs/README.zh-CN.md) · [Dataset access](docs/datasets.md) · [Reproduction](docs/reproduction.md) · [Publication guide](docs/publishing.md) · [Agent setup](docs/baselines.md) · [Evaluation protocol](docs/protocol.md)
 
+**[Download the EvoLink-Bench dataset (Google Drive)](https://drive.google.com/file/d/155bYrpG0peaFQd1Yn16mH35Q5s8kj2e9/view?usp=sharing)**
+
 ## Overview
 
 ![An evidence-grading case at left and a house-price regression case at right flank the EvoLink-Bench protocol. The center shows the agent, workspace and verifier within a turn and the three persistence conditions across turns.](assets/evolink-overview.png)
@@ -32,6 +34,8 @@ Task streams are ordered and may contain explicit dependencies. A later task can
 An explicit post-turn update is an adapter-defined learning procedure that runs after task execution using the trajectory and feedback available to that adapter. Files created during ordinary execution are workspace artifacts. Their persistence alone does not establish a learning update.
 
 ## Scope and data access
+
+The [dataset is available on Google Drive](https://drive.google.com/file/d/155bYrpG0peaFQd1Yn16mH35Q5s8kj2e9/view?usp=sharing). See the [dataset guide](docs/datasets.md) for the package layout and keep reference answers and grading assets on the evaluator side during benchmark runs.
 
 This source repository contains the evaluator, adapters, schemas, examples, and offline tests. The offline examples run from a source checkout. Reproducing a reported experiment also requires the corresponding authorized task package, grading assets, and runtime configuration. See the dataset access and reproduction guides for those prerequisites.
 
