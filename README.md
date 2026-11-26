@@ -68,5 +68,11 @@ python -m compileall -q evolink_bench baseline\adapters tools tests
 Project-authored code is released under the MIT License. Third-party code, data, task assets, and notices remain subject to their own terms. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Citation
-
-Please cite EvoLink-Bench using the software citation in [CITATION.cff](CITATION.cff).
+```
+@article{chen2026evolinkbench,
+  title={EvoLink-Bench: A Benchmark for Evaluating Self-Evolving Agents in Long-Horizon Interdependent Task Streams},
+  author={Chen, Wei and Lu, Xiaodong and Shen, Weihao and Li, Gongxun and Guo, Xingyu and Sun, Qihang and Zhang, Fuwei and Zhang, Zhao and Ban, Yikun and Li, Shuang and Wang, Deqing and Zhuang, Fuzhen},
+  journal={arXiv preprint arXiv:2611.34400},
+  year={2026}
+}  
+```
