@@ -1,4 +1,4 @@
-# EvoLink-Bench
+# EvoLink-Bench [![arXiv](https://img.shields.io/badge/arXiv-EvoLink--Bench-b31b1b.svg?logo=arxiv)](https://arxiv.org/abs/2611.34400)
 
 **A benchmark for evaluating self-evolving agents in long-horizon interdependent task streams.**
 
